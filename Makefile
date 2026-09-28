@@ -22,13 +22,13 @@ all: download
 download:
 	@for region in $(REGIONS); do \
 		mkdir -p downloads/$$(dirname $$region); \
-		wget -N -q --show-progress -P downloads/$$(dirname $$region) \
+		wget -N -q --show-progress --progress=bar:force:noscroll -P downloads/$$(dirname $$region) \
 			https://download.geofabrik.de/$$region-latest.osm.pbf || exit 1; \
 	done
 
 downloads/%-latest.osm.pbf:
 	@mkdir -p $(dir $@)
-	wget -N -q --show-progress -P $(dir $@) https://download.geofabrik.de/$*-latest.osm.pbf
+	wget -N -q --show-progress --progress=bar:force:noscroll -P $(dir $@) https://download.geofabrik.de/$*-latest.osm.pbf
 
 filtered/%.osm.pbf: downloads/%-latest.osm.pbf stations.params
 	@mkdir -p $(dir $@)
