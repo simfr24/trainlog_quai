@@ -1,0 +1,50 @@
+name: quai
+
+services:
+  db:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_USER: quai
+      POSTGRES_PASSWORD: quai
+      POSTGRES_DB: quai
+    volumes:
+      - db:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "quai"]
+      interval: 5s
+      retries: 20
+    restart: always
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://quai:quai@db/quai
+    ports:
+      - "5020:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  import:
+    build: ./import
+    profiles: ["import"]
+    environment:
+      PGHOST: db
+      PGUSER: quai
+      PGPASSWORD: quai
+      PGDATABASE: quai
+    volumes:
+      - .:/data
+    command:
+      - sh
+      - -c
+      - osm2pgsql --output=flex --style=/data/flex.lua /data/filtered.osm.pbf && python3 /data/build.py
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db:
