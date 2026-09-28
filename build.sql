@@ -1,17 +1,20 @@
 -- Turns the raw osm2pgsql tables (stops, rels, boundaries) into one row per station and
 -- mode, with its names, place and lines, ready to search.
+--
+-- Runs in the `build` schema, which build.py swaps in for `live` once complete. Extensions
+-- and functions live in public, which is not swapped.
 
 -- @step setup
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS unaccent;
-CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS unaccent SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public;
 
-CREATE OR REPLACE FUNCTION fold(text) RETURNS text AS $$
+CREATE OR REPLACE FUNCTION public.fold(text) RETURNS text AS $$
     SELECT lower(public.unaccent('public.unaccent'::regdictionary, COALESCE($1, '')))
 $$ LANGUAGE sql IMMUTABLE;
 
 -- The station, stop or terminal itself, as opposed to its platforms and stop positions.
-CREATE OR REPLACE FUNCTION is_primary_stop(tags jsonb) RETURNS boolean AS $$
+CREATE OR REPLACE FUNCTION public.is_primary_stop(tags jsonb) RETURNS boolean AS $$
     SELECT (tags ->> 'railway' IN ('station', 'halt', 'tram_stop')
             OR tags ->> 'highway' = 'bus_stop'
             OR tags ->> 'amenity' IN ('bus_station', 'ferry_terminal')
@@ -278,22 +281,27 @@ FROM boundaries;
 CREATE INDEX ON boundary_parts USING gist (geom);
 
 -- @step country, region, city
+-- One lookup per station for every level at once. The country falls back on the region's
+-- ISO3166-2 code ("FR-IDF"), for extracts that cut the country's own boundary.
 UPDATE stations s SET
-    -- Falls back on the region's ISO3166-2 code ("FR-IDF"), for extracts that cut the
-    -- country's own boundary.
-    country = COALESCE(
-        (SELECT upper(b.tags ->> 'ISO3166-1:alpha2') FROM boundary_parts b
-         WHERE b.admin_level = 2 AND ST_Contains(b.geom, s.geom) LIMIT 1),
-        (SELECT upper(left(b.tags ->> 'ISO3166-2', 2)) FROM boundary_parts b
-         WHERE b.admin_level = 4 AND b.tags ? 'ISO3166-2' AND ST_Contains(b.geom, s.geom) LIMIT 1)
-    ),
-    region  = (SELECT b.tags ->> 'name' FROM boundary_parts b
-               WHERE b.admin_level = 4 AND ST_Contains(b.geom, s.geom) LIMIT 1),
-    city    = (SELECT jsonb_strip_nulls(jsonb_build_object(
-                          'name', b.tags ->> 'name', 'name:en', b.tags ->> 'name:en'))
-               FROM boundary_parts b
-               WHERE b.admin_level BETWEEN 6 AND 8 AND ST_Contains(b.geom, s.geom)
-               ORDER BY b.admin_level DESC LIMIT 1);
+    country = COALESCE(p.country, p.region_country),
+    region  = p.region,
+    city    = p.city
+FROM (
+    SELECT s.station_id,
+           max(upper(b.tags ->> 'ISO3166-1:alpha2')) FILTER (WHERE b.admin_level = 2) AS country,
+           max(upper(left(b.tags ->> 'ISO3166-2', 2))) FILTER (WHERE b.admin_level = 4)
+               AS region_country,
+           max(b.tags ->> 'name') FILTER (WHERE b.admin_level = 4) AS region,
+           (array_agg(jsonb_strip_nulls(jsonb_build_object(
+                'name', b.tags ->> 'name', 'name:en', b.tags ->> 'name:en'))
+                ORDER BY b.admin_level DESC) FILTER (WHERE b.admin_level BETWEEN 6 AND 8))[1]
+               AS city
+    FROM stations s
+    JOIN boundary_parts b ON ST_Contains(b.geom, s.geom)
+    GROUP BY s.station_id
+) p
+WHERE s.station_id = p.station_id;
 
 
 -- @step station lines

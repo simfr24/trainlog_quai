@@ -3,6 +3,10 @@ name: quai
 services:
   db:
     image: postgis/postgis:17-3.5
+    # Sized for building the world; the build session raises its own memory further.
+    command: postgres -c shared_buffers=4GB -c max_wal_size=16GB -c max_parallel_workers=8
+    # Parallel queries share memory through /dev/shm, 64MB by default.
+    shm_size: 4gb
     environment:
       POSTGRES_USER: quai
       POSTGRES_PASSWORD: quai
@@ -10,7 +14,7 @@ services:
     volumes:
       - db:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "quai"]
       interval: 5s
@@ -20,9 +24,15 @@ services:
   api:
     build: ./api
     environment:
-      DATABASE_URL: postgresql://quai:quai@db/quai
+      DATABASE_URL: postgresql://quai:quai@db/quai?options=-csearch_path%3Dlive,public
     ports:
-      - "5020:5000"
+      - "127.0.0.1:5020:5000"
+    # The reverse proxy serves <name>.srv.trainlog.me from the container named <name>, on
+    # port 5000, over this network.
+    networks:
+      default:
+      trainlog:
+        aliases: [quai]
     depends_on:
       db:
         condition: service_healthy
@@ -41,10 +51,18 @@ services:
     command:
       - sh
       - -c
-      - osm2pgsql --output=flex --style=/data/flex.lua /data/filtered.osm.pbf && python3 /data/build.py
+      - >-
+        psql -qc 'DROP SCHEMA IF EXISTS build CASCADE; CREATE SCHEMA build'
+        && osm2pgsql --output=flex --schema=build --style=/data/flex.lua /data/filtered.osm.pbf
+        && python3 /data/build.py
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   db:
+
+networks:
+  trainlog:
+    name: trainlog_network
+    external: true
