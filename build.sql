@@ -111,7 +111,9 @@ CROSS JOIN LATERAL (VALUES
     ('metro',     s.tags ->> 'station' IN ('subway', 'light_rail', 'monorail')
                   OR s.tags ->> 'subway' = 'yes' OR s.tags ->> 'light_rail' = 'yes'
                   OR s.tags ->> 'monorail' = 'yes'),
-    ('tram',      s.tags ->> 'railway' = 'tram_stop' OR s.tags ->> 'tram' = 'yes'),
+    -- Light rail is either, depending on the city: Bybanen is a tram, the DLR a metro.
+    ('tram',      s.tags ->> 'railway' = 'tram_stop' OR s.tags ->> 'tram' = 'yes'
+                  OR s.tags ->> 'station' = 'light_rail' OR s.tags ->> 'light_rail' = 'yes'),
     ('bus',       s.tags ->> 'highway' = 'bus_stop' OR s.tags ->> 'amenity' = 'bus_station'
                   OR s.tags ->> 'bus' = 'yes'),
     ('ferry',     s.tags ->> 'amenity' = 'ferry_terminal' OR s.tags ->> 'ferry' = 'yes'),

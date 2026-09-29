@@ -275,7 +275,7 @@ def variant_stops(variant):
 # The tag marking a stop position as used by each mode ("train=yes").
 MODE_TAGS = {
     "train": ["train"],
-    "tram": ["tram"],
+    "tram": ["tram", "light_rail"],
     "metro": ["subway", "light_rail", "monorail"],
     "bus": ["bus", "trolleybus"],
     "ferry": ["ferry"],
