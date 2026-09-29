@@ -39,16 +39,19 @@ def search():
         "limit": min(request.args.get("limit", 10, type=int), 50),
         **point_params(),
     }
-    # Prefix matches first, then trigram similarity; a given position breaks ties by distance.
+    # Prefix matches first, then word similarity; a given position breaks ties by distance.
+    # Word similarity scores the typed text against the best-matching part of a name, as typing
+    # is; whole-name similarity lets a short word like "stavanger" match every name sharing
+    # " st" or "er ", which the index then has to recheck by the million.
     rows = query(
         f"""
         SELECT {COLUMNS}
         FROM (
             SELECT n.station_id,
                    bool_or(n.folded LIKE fold(%(q)s) || '%%') AS prefix,
-                   max(similarity(n.folded, fold(%(q)s))) AS score
+                   max(word_similarity(fold(%(q)s), n.folded)) AS score
             FROM station_names n
-            WHERE n.folded LIKE fold(%(q)s) || '%%' OR n.folded %% fold(%(q)s)
+            WHERE n.folded LIKE fold(%(q)s) || '%%' OR fold(%(q)s) <%% n.folded
             GROUP BY n.station_id
         ) m
         JOIN stations s USING (station_id)
