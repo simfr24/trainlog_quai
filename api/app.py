@@ -1,5 +1,6 @@
 """Station search over the tables build.sql produces."""
 
+import math
 import os
 import re
 
@@ -121,6 +122,17 @@ def station_for_object(ref, mode):
 # How many service variants to read stops for; enough to find the most direct.
 MAX_SERVICE_VARIANTS = 20
 
+# A path through the calls this much longer than the straight line between the ends means
+# the stop list is out of order, as some routes are mapped: following it would detour.
+MAX_DETOUR = 1.8
+
+
+def metres(a, b):
+    lat1, lat2 = math.radians(a["lat"]), math.radians(b["lat"])
+    dlat, dlng = lat2 - lat1, math.radians(b["lng"] - a["lng"])
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+    return 12742000 * math.asin(math.sqrt(h))
+
 
 @app.get("/line")
 def line():
@@ -231,13 +243,15 @@ def line():
 def variant_stops(variant):
     """The points of a route variant's calls between its two ends, in order.
 
-    Its stop positions, which sit on the track, where it has them; the two ends are kept
-    whatever they are, since they are where the trip starts and stops.
+    Platforms are left out, as they sit beside the track rather than on it; every other
+    call is kept, whether mapped as a stop position or as the station itself. The two ends
+    are kept whatever they are, since they are where the trip starts and stops.
     """
     rows = query(
         """
         SELECT ST_Y(st.geom) AS lat, ST_X(st.geom) AS lng,
-               (st.tags ->> 'public_transport' = 'stop_position') IS TRUE AS on_track
+               (st.tags ->> 'public_transport' = 'platform' OR st.tags ->> 'railway' = 'platform')
+                   IS TRUE AS platform
         FROM route_stops rm
         JOIN stops st ON st.osm_type = rm.osm_type AND st.osm_id = rm.osm_id
         WHERE rm.relation_id = %(relation_id)s AND rm.seq BETWEEN %(low)s AND %(high)s
@@ -247,7 +261,10 @@ def variant_stops(variant):
     )
     if variant["reversed"]:
         rows.reverse()
-    middle = rows[1:-1]
-    if any(row["on_track"] for row in middle):
-        middle = [row for row in middle if row["on_track"]]
-    return [{"lat": row["lat"], "lng": row["lng"]} for row in rows[:1] + middle + rows[-1:]]
+    middle = [row for row in rows[1:-1] if not row["platform"]]
+    stops = [{"lat": row["lat"], "lng": row["lng"]} for row in rows[:1] + middle + rows[-1:]]
+    if len(stops) > 2:
+        through = sum(metres(a, b) for a, b in zip(stops, stops[1:]))
+        if through > MAX_DETOUR * metres(stops[0], stops[-1]):
+            return [stops[0], stops[-1]]
+    return stops
