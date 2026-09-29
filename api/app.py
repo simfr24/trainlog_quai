@@ -122,8 +122,9 @@ def station_for_object(ref, mode):
 # How many service variants to read stops for; enough to find the most direct.
 MAX_SERVICE_VARIANTS = 20
 
-# A path through the calls this much longer than the straight line between the ends means
-# the stop list is out of order, as some routes are mapped: following it would detour.
+# A stop list is out of order, as some routes are mapped, when its path is this much longer
+# than the straight line between the ends and one hop alone covers half of that line.
+# The hop test keeps ring lines, whose path is long but made of short hops.
 MAX_DETOUR = 1.8
 
 
@@ -264,7 +265,64 @@ def variant_stops(variant):
     middle = [row for row in rows[1:-1] if not row["platform"]]
     stops = [{"lat": row["lat"], "lng": row["lng"]} for row in rows[:1] + middle + rows[-1:]]
     if len(stops) > 2:
-        through = sum(metres(a, b) for a, b in zip(stops, stops[1:]))
-        if through > MAX_DETOUR * metres(stops[0], stops[-1]):
+        direct = metres(stops[0], stops[-1])
+        hops = [metres(a, b) for a, b in zip(stops, stops[1:])]
+        if sum(hops) > MAX_DETOUR * direct and max(hops) > direct / 2:
             return [stops[0], stops[-1]]
     return stops
+
+
+# The tag marking a stop position as used by each mode ("train=yes").
+MODE_TAGS = {
+    "train": ["train"],
+    "tram": ["tram"],
+    "metro": ["subway", "light_rail", "monorail"],
+    "bus": ["bus", "trolleybus"],
+    "ferry": ["ferry"],
+    "funicular": ["funicular"],
+    "aerialway": ["aerialway"],
+}
+SNAP_RADIUS_M = 300
+
+
+@app.post("/snap")
+def snap():
+    """Each point moved onto the nearest stop position of `mode`, or left where it is.
+
+    Timetables often place a stop at the station building, which a router snaps onto the
+    nearest track or road of any kind: the tram line in front of the station rather than the
+    platforms. A stop position sits on the tracks or road the mode itself uses.
+    """
+    body = request.get_json(silent=True) or {}
+    keys = MODE_TAGS.get(body.get("mode"))
+    points = body.get("points") or []
+    if not keys or not points:
+        return jsonify(points=points)
+    rows = query(
+        """
+        SELECT p.i, ST_Y(n.geom) AS lat, ST_X(n.geom) AS lng
+        FROM unnest(%(lats)s::float8[], %(lngs)s::float8[]) WITH ORDINALITY AS p(lat, lng, i)
+        CROSS JOIN LATERAL (
+            SELECT st.geom
+            FROM stops st
+            WHERE st.geom && ST_Expand(ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326), 0.01)
+              AND st.tags ->> 'public_transport' = 'stop_position'
+              AND EXISTS (SELECT 1 FROM unnest(%(keys)s::text[]) AS k WHERE st.tags ->> k = 'yes')
+              AND ST_DWithin(st.geom::geography,
+                             ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography,
+                             %(radius)s)
+            ORDER BY st.geom <-> ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)
+            LIMIT 1
+        ) n
+        """,
+        {
+            "lats": [float(point["lat"]) for point in points],
+            "lngs": [float(point["lng"]) for point in points],
+            "keys": keys,
+            "radius": SNAP_RADIUS_M,
+        },
+    )
+    snapped = [dict(point) for point in points]
+    for row in rows:
+        snapped[row["i"] - 1] = {"lat": row["lat"], "lng": row["lng"]}
+    return jsonify(points=snapped)

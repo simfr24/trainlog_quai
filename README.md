@@ -18,3 +18,4 @@ Endpoints:
     /reverse?lat=48.84&lon=2.37&mode=metro&radius=1      (radius in km)
     /object/N/27371862                                    (stations containing an OSM object)
     /line?from=N27371862&to=N1234&mode=train&service=6033 (lines and services between two stations)
+    POST /snap {mode, points: [{lat, lng}]}                (points moved onto the nearest stop position of the mode)
