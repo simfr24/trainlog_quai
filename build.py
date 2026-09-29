@@ -94,8 +94,12 @@ def main():
         if "--reuse" in sys.argv:
             conn.execute("DROP SCHEMA IF EXISTS build CASCADE; CREATE SCHEMA build")
             for table in RAW_TABLES:
-                conn.execute(f"CREATE TABLE build.{table} (LIKE live.{table} INCLUDING ALL)")
-                conn.execute(f"INSERT INTO build.{table} SELECT * FROM live.{table}")
+                def report(elapsed):
+                    print(f"\rcopying {table:<20} {duration(elapsed):>7}", end="", flush=True)
+
+                report(run_step(conn, f"CREATE TABLE build.{table} (LIKE live.{table} INCLUDING ALL);"
+                                      f"INSERT INTO build.{table} SELECT * FROM live.{table}", report))
+                print()
         conn.execute(SESSION)
         conn.execute("SET search_path = build, public")
 
