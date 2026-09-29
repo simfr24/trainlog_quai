@@ -22,6 +22,10 @@ CREATE OR REPLACE FUNCTION public.is_primary_stop(tags jsonb) RETURNS boolean AS
             OR tags ->> 'public_transport' = 'station') IS TRUE
 $$ LANGUAGE sql IMMUTABLE;
 
+-- osm2pgsql indexes these by position only; /line looks routes and stops up by id.
+CREATE INDEX IF NOT EXISTS stops_osm_id_idx ON stops (osm_type, osm_id);
+CREATE INDEX IF NOT EXISTS rels_relation_id_idx ON rels (relation_id);
+
 DROP TABLE IF EXISTS station_names, stations, station_objects, stop_modes, area_group, line_routes,
     rel_members, route_stops, boundary_parts;
 
@@ -31,7 +35,8 @@ CREATE TABLE rel_members AS
 SELECT r.relation_id,
        r.tags ->> 'public_transport' = 'stop_area' AS is_stop_area,
        r.tags ->> 'route' AS route,
-       e.member ->> 'type' AS osm_type,
+       -- char(1) like osm2pgsql's own osm_type: a text one defeats the indexes on joins.
+       (e.member ->> 'type')::char(1) AS osm_type,
        (e.member ->> 'ref')::bigint AS osm_id,
        e.member ->> 'role' AS role,
        e.seq

@@ -146,8 +146,10 @@ def line():
     if params["from"] is None or params["to"] is None:
         return jsonify(lines=[], services=[])
 
-    # For each route calling at both, the stretch from the origin to the destination's
-    # next call after it, so the direction is the one travelled.
+    # For each route calling at both, the stretch from the origin to the destination's next
+    # call after it, so the direction is the one travelled. Routes in the older mapping
+    # scheme (public_transport:version 1) are one relation for both directions, so for
+    # them the destination may also come before the origin, and the stretch is read back.
     variants = query(
         """
         WITH ends AS (
@@ -156,25 +158,34 @@ def line():
             JOIN station_objects o ON o.mode = s.mode AND o.key = s.key
             WHERE s.station_id IN (%(from)s, %(to)s)
         ),
-        from_pos AS (
-            SELECT rm.relation_id, min(rm.seq) AS pf
+        calls AS (
+            SELECT rm.relation_id, rm.seq, e.station_id
             FROM route_stops rm
             JOIN ends e ON e.osm_type = rm.osm_type AND e.osm_id = rm.osm_id
-            WHERE e.station_id = %(from)s
-            GROUP BY rm.relation_id
         ),
-        to_pos AS (
-            SELECT rm.relation_id, min(rm.seq) AS pt
-            FROM route_stops rm
-            JOIN ends e ON e.osm_type = rm.osm_type AND e.osm_id = rm.osm_id
-            JOIN from_pos f ON f.relation_id = rm.relation_id
-            WHERE e.station_id = %(to)s AND rm.seq > f.pf
-            GROUP BY rm.relation_id
+        origins AS (
+            SELECT relation_id, min(seq) AS first_call, max(seq) AS last_call
+            FROM calls WHERE station_id = %(from)s
+            GROUP BY relation_id
+        ),
+        spans AS (
+            SELECT o.relation_id, o.first_call AS low, min(c.seq) AS high, false AS reversed
+            FROM origins o
+            JOIN calls c ON c.relation_id = o.relation_id
+                        AND c.station_id = %(to)s AND c.seq > o.first_call
+            GROUP BY o.relation_id, o.first_call
+            UNION ALL
+            SELECT o.relation_id, max(c.seq) AS low, o.last_call AS high, true AS reversed
+            FROM origins o
+            JOIN rels r ON r.relation_id = o.relation_id
+            JOIN calls c ON c.relation_id = o.relation_id
+                        AND c.station_id = %(to)s AND c.seq < o.last_call
+            WHERE COALESCE(r.tags ->> 'public_transport:version', '1') <> '2'
+            GROUP BY o.relation_id, o.last_call
         )
-        SELECT r.relation_id, %(mode)s AS mode, r.tags, f.pf, t.pt,
+        SELECT r.relation_id, %(mode)s AS mode, r.tags, sp.low, sp.high, sp.reversed,
                lr.relation_id IS NOT NULL AS is_line
-        FROM from_pos f
-        JOIN to_pos t USING (relation_id)
+        FROM spans sp
         JOIN rels r USING (relation_id)
         LEFT JOIN line_routes lr ON lr.relation_id = r.relation_id AND lr.mode = %(mode)s
         WHERE r.tags ? 'ref'
@@ -182,7 +193,7 @@ def line():
           AND (%(ref)s::text IS NULL OR r.tags ->> 'ref' = %(ref)s)
           AND (%(service)s::text IS NULL
                OR r.tags ->> 'ref' ~ ('(^|[^0-9])' || %(service)s || '([^0-9]|$)'))
-        ORDER BY is_line DESC, t.pt - f.pf
+        ORDER BY is_line DESC, sp.high - sp.low
         """,
         params,
     )
@@ -229,11 +240,13 @@ def variant_stops(variant):
                (st.tags ->> 'public_transport' = 'stop_position') IS TRUE AS on_track
         FROM route_stops rm
         JOIN stops st ON st.osm_type = rm.osm_type AND st.osm_id = rm.osm_id
-        WHERE rm.relation_id = %(relation_id)s AND rm.seq BETWEEN %(pf)s AND %(pt)s
+        WHERE rm.relation_id = %(relation_id)s AND rm.seq BETWEEN %(low)s AND %(high)s
         ORDER BY rm.seq
         """,
         variant,
     )
+    if variant["reversed"]:
+        rows.reverse()
     middle = rows[1:-1]
     if any(row["on_track"] for row in middle):
         middle = [row for row in middle if row["on_track"]]

@@ -1,3 +1,4 @@
 *.pbf
 .build_timings.json
 __pycache__/
+*.tmp
