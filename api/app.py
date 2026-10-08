@@ -290,6 +290,45 @@ def route(relation_id):
     return jsonify(routes=rows)
 
 
+@app.post("/nearest")
+def nearest():
+    """The nearest station of `mode` within `radius` metres of each point, for many at once:
+    {mode, radius, points: [[lat, lng], ...]} gives {stations: [station or null, ...]} in
+    the points' order. What a trip's ends were, for a client tidying its station names."""
+    body = request.get_json(silent=True) or {}
+    mode, points = body.get("mode"), body.get("points") or []
+    if not mode or not isinstance(points, list) or len(points) > 5000:
+        return jsonify(error="mode and at most 5000 points are required"), 400
+    try:
+        lats = [float(p[0]) for p in points]
+        lngs = [float(p[1]) for p in points]
+        radius = min(float(body.get("radius") or 400), 2000)
+    except (TypeError, ValueError, IndexError):
+        return jsonify(error="points are [lat, lng] pairs"), 400
+    rows = query(
+        f"""
+        SELECT p.i, {COLUMNS}
+        FROM unnest(%(lats)s::float8[], %(lngs)s::float8[]) WITH ORDINALITY AS p(lat, lng, i)
+        CROSS JOIN LATERAL (
+            SELECT * FROM stations s
+            WHERE s.mode = %(mode)s
+              AND s.geom && ST_Expand(ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326), %(degrees)s)
+            ORDER BY s.geom <-> ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)
+            LIMIT 1
+        ) s
+        WHERE ST_DWithin(s.geom::geography,
+                         ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography, %(radius)s)
+        """,
+        # The box around a point: radius in degrees of latitude, widened for longitude up to 70°.
+        {"lats": lats, "lngs": lngs, "mode": mode, "radius": radius,
+         "degrees": radius / 111320 * 3},
+    )
+    stations = [None] * len(points)
+    for row in with_labels(rows):
+        stations[row.pop("i") - 1] = row
+    return jsonify(stations=stations)
+
+
 @app.get("/reverse")
 def reverse():
     params = {

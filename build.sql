@@ -117,7 +117,7 @@ CREATE INDEX ON line_routes (relation_id);
 -- @step stop area groups
 -- Stop areas sharing a station node are one station: Châtelet is a stop_area per line.
 -- Linked through station nodes only, as a shared entrance can join two distinct stations.
-CREATE TABLE area_group AS
+CREATE UNLOGGED TABLE area_group AS
 WITH RECURSIVE links AS (
     SELECT DISTINCT relation_id AS a, relation_id AS b FROM rel_members WHERE is_stop_area
     UNION
@@ -139,7 +139,7 @@ CREATE INDEX ON area_group (relation_id);
 
 -- @step stop modes
 -- Which modes each stop serves. Must match Trainlog's trip types.
-CREATE TABLE stop_modes AS
+CREATE UNLOGGED TABLE stop_modes AS
 SELECT s.osm_type, s.osm_id, m.mode
 FROM stops s
 CROSS JOIN LATERAL (VALUES
@@ -169,7 +169,7 @@ CREATE INDEX ON stop_modes (osm_type, osm_id);
 -- Every object of a station, keyed by what groups them: its stop areas, else its wikidata,
 -- else the object alone. Only primary objects (the station, stop or terminal itself) can
 -- found a station; platforms and stop positions join one.
-CREATE TABLE station_objects AS
+CREATE UNLOGGED TABLE station_objects AS
 WITH object_area AS (
     SELECT rm.osm_type, rm.osm_id, min(ag.group_id) AS group_id
     FROM rel_members rm
@@ -248,28 +248,30 @@ WHERE o.mode = m.mode AND o.key = m.key AND m.key <> m.merged_key;
 -- station to found. They belong to the nearest station of their mode, when one is close:
 -- routes list their calls by these objects, so leaving them out loses the calls.
 CREATE INDEX ON station_objects USING gist (mode, geom) WHERE is_primary;
+ANALYZE station_objects;
+-- Found into a table first: a query creating one runs on all cores, an UPDATE on one.
+CREATE UNLOGGED TABLE stray_stations AS
 WITH strays AS (
     SELECT DISTINCT ON (o.mode, o.key) o.mode, o.key, o.geom
     FROM station_objects o
     WHERE NOT EXISTS (
         SELECT 1 FROM station_objects p WHERE p.mode = o.mode AND p.key = o.key AND p.is_primary
     )
-),
-nearest AS (
-    SELECT st.mode, st.key, n.key AS station_key
-    FROM strays st
-    CROSS JOIN LATERAL (
-        SELECT p.key, p.geom
-        FROM station_objects p
-        WHERE p.mode = st.mode AND p.is_primary
-        ORDER BY p.geom <-> st.geom
-        LIMIT 1
-    ) n
-    WHERE ST_DWithin(n.geom::geography, st.geom::geography, 400)
 )
+SELECT st.mode, st.key, n.key AS station_key
+FROM strays st
+CROSS JOIN LATERAL (
+    SELECT p.key, p.geom
+    FROM station_objects p
+    WHERE p.mode = st.mode AND p.is_primary
+    ORDER BY p.geom <-> st.geom
+    LIMIT 1
+) n
+WHERE ST_DWithin(n.geom::geography, st.geom::geography, 400);
 UPDATE station_objects o SET key = n.station_key
-FROM nearest n
+FROM stray_stations n
 WHERE o.mode = n.mode AND o.key = n.key;
+DROP TABLE stray_stations;
 
 -- @step bus stations
 -- A bus station and the stops around it are one station, whatever their names ("Gare SNCF"
@@ -297,7 +299,7 @@ WHERE o.mode = 'bus' AND o.key = a.key;
 
 
 -- @step stations
-CREATE TABLE stations AS
+CREATE UNLOGGED TABLE stations AS
 WITH rep AS (
     SELECT DISTINCT ON (mode, key) mode, key, osm_type, osm_id, tags, geom
     FROM station_objects
@@ -414,7 +416,7 @@ WHERE s.station_id = r.station_id;
 -- @step boundary pieces
 -- Boundaries cut into small pieces: a point-in-polygon test then touches a few hundred
 -- vertices instead of a whole country's outline.
-CREATE TABLE boundary_parts AS
+CREATE UNLOGGED TABLE boundary_parts AS
 SELECT relation_id, admin_level, tags, ST_Subdivide(geom, 256) AS geom
 FROM boundaries;
 CREATE INDEX ON boundary_parts USING gist (geom);
@@ -427,12 +429,8 @@ CREATE INDEX ON boundary_parts USING gist (geom);
 -- One lookup per station for every level at once. The country falls back on the region's
 -- ISO3166-2 code ("FR-IDF"), for extracts that cut the country's own boundary. The city is
 -- the smallest boundary places.csv names (city_overrides), else the lowest municipality.
-UPDATE stations s SET
-    country = COALESCE(p.country, p.region_country),
-    region  = p.region,
-    city    = p.city,
-    boundary_ids = p.boundary_ids
-FROM (
+-- Found into a table first, on all cores, then set in one pass.
+CREATE UNLOGGED TABLE station_places AS
     SELECT s.station_id,
            max(upper(b.tags ->> 'ISO3166-1:alpha2')) FILTER (WHERE b.admin_level = 2) AS country,
            max(upper(left(b.tags ->> 'ISO3166-2', 2))) FILTER (WHERE b.admin_level = 4)
@@ -453,9 +451,15 @@ FROM (
     FROM stations s
     JOIN boundary_parts b ON ST_Contains(b.geom, s.geom)
     LEFT JOIN city_overrides co ON co.relation_id = b.relation_id
-    GROUP BY s.station_id
-) p
+    GROUP BY s.station_id;
+UPDATE stations s SET
+    country = COALESCE(p.country, p.region_country),
+    region  = p.region,
+    city    = p.city,
+    boundary_ids = p.boundary_ids
+FROM station_places p
 WHERE s.station_id = p.station_id;
+DROP TABLE station_places;
 
 
 -- @step station lines
@@ -499,7 +503,7 @@ WHERE s.station_id = l.station_id;
 -- "2"): its track can sit on the stop position. Only when unambiguous: each is the other's
 -- nearest, within 30m, with the platform's next stop position at least half as far again.
 -- Not a "1;2" island platform, which cannot say which of its two stop positions is which.
-CREATE TABLE platform_stops AS
+CREATE UNLOGGED TABLE platform_stops AS
 WITH platforms AS (
     SELECT st.station_id, o.osm_type, o.osm_id, o.geom
     FROM stations st
@@ -589,7 +593,7 @@ WHERE s.station_id = t.station_id;
 -- Brussels-Luxembourg sits in Ixelles, but says Brussels. A boundary's names count whole,
 -- split where bilingual ("Ixelles - Elsene"), and without generic words, so that "Région de
 -- Bruxelles-Capitale" says "bruxelles". "臺北" is the start of "臺北市".
-CREATE TABLE boundary_names AS
+CREATE UNLOGGED TABLE boundary_names AS
 SELECT DISTINCT relation_id, name
 FROM (
     SELECT b.relation_id, search_fold(trim(part)) AS full_name,
@@ -628,7 +632,7 @@ $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- Every run of every station against the names of its boundaries, as one join: computed
 -- first, as joining a function per station makes a lookup per station.
-CREATE TEMP TABLE station_runs AS
+CREATE UNLOGGED TABLE station_runs AS
 SELECT st.station_id, bid, run
 FROM stations st,
      unnest(st.boundary_ids) AS bid,

@@ -5,10 +5,13 @@ services:
     image: postgis/postgis:17-3.5
     # Sized for building the world; the build session raises its own memory further.
     # shared_buffers holds what searches read (about 4GB for the world), and pg_prewarm
-    # reloads it after a restart, as the disk is a hard drive.
+    # reloads it after a restart, as the disk is a hard drive. wal_level=minimal: a table
+    # created or rewritten whole is not written to the WAL as well, halving a build's
+    # writes; nothing here replicates, and a lost build is rebuilt from OSM.
     command: >-
       postgres -c shared_buffers=${QUAI_SHARED_BUFFERS:-8GB} -c max_wal_size=16GB
       -c max_parallel_workers=8 -c shared_preload_libraries=pg_prewarm
+      -c wal_level=minimal -c max_wal_senders=0
     # Parallel queries share memory through /dev/shm, 64MB by default.
     shm_size: 4gb
     environment:

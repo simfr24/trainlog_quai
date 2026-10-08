@@ -266,6 +266,12 @@ def main():
         key_redirects(conn)
         conn.execute("CREATE UNIQUE INDEX ON key_redirects (mode, old_key)")
 
+        # Built unlogged, being rewritten step after step; logged once done, before they serve
+        # (with wal_level=minimal the rewrite is not written to the WAL either).
+        print("logging the tables...", flush=True)
+        for table in ("stations", "station_objects"):
+            conn.execute(f"ALTER TABLE {table} SET LOGGED")
+
         with conn.transaction():
             conn.execute("DROP SCHEMA IF EXISTS live CASCADE")
             conn.execute("ALTER SCHEMA build RENAME TO live")
