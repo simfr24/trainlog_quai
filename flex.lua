@@ -24,7 +24,6 @@ local boundaries = osm2pgsql.define_relation_table('boundaries', {
 local function is_stop(tags)
     local railway = tags.railway
     return railway == 'station' or railway == 'halt' or railway == 'tram_stop'
-        or railway == 'subway_entrance'
         or tags.public_transport ~= nil
         or tags.highway == 'bus_stop'
         or tags.amenity == 'bus_station' or tags.amenity == 'ferry_terminal'
@@ -47,7 +46,7 @@ function osm2pgsql.process_relation(object)
     local tags = object.tags
     local level = tonumber(tags.admin_level)
     if tags.boundary == 'administrative' then
-        if level == 2 or level == 4 or (level and level >= 6 and level <= 8) then
+        if level == 2 or (level and level >= 4 and level <= 8) then
             boundaries:insert({ admin_level = level, tags = tags, geom = object:as_multipolygon() })
         end
         return

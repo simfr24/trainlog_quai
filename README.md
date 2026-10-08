@@ -29,7 +29,9 @@ key, `key_redirects` sends it to the station that took over most of its objects.
 Each result has a `label`: the station's `name:<lang>` when `lang` is given and mapped, else
 `latin`, its international Latin-script name (`int_name`, a Latin `name`, a mapped
 romanisation, or a BGN/PCGN transliteration; see latin.py). `matched` is the spelling the
-query matched, which may be in another language than the label.
+query matched, which may be in another language than the label. `needs_place` says the name
+does not tell where the station is ("Gare", "Gare de Lyon"), so that a client can prefix its
+`city` ("Royan - Gare"); it is false where any name of an enclosing boundary is in it already.
 
 Rail stations (train, metro, tram, funicular) carry their `tracks`, `[{ref, lat, lng, on_track}]`:
 where a vehicle calling at that track stops. `on_track` is false where only a platform between

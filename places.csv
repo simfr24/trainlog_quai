@@ -1,0 +1,30 @@
+# Boundaries that are the city of every station inside them, whatever their admin level,
+# where the municipality quai would otherwise take is not what anyone calls the place:
+# Taipei's districts, Moscow's raions, London's boroughs. Boundaries tagged place=city at
+# region level or below count without being listed.
+#
+# A boundary is given by its OSM relation id, or by its admin_level and exact OSM name
+# (boundary_name); a name absent from the data matches nothing. name and name_en override
+# how the city is written (empty: the boundary's own).
+relation_id,admin_level,boundary_name,name,name_en,note
+1293250,,,,,Taipei (districts are level 7)
+1527220,,,,,New Taipei
+2921154,,,,,Taichung
+2127079,,,,,Kaohsiung
+,4,臺南市,,,Tainan
+,4,桃園市,,,Taoyuan
+,4,Москва,,,Moscow (raions)
+,4,Санкт-Петербург,,,Saint Petersburg
+,4,Berlin,,,Berlin (Bezirke)
+,4,Hamburg,,,Hamburg
+,4,Wien,,,Vienna (Bezirke)
+,4,Région de Bruxelles-Capitale - Brussels Hoofdstedelijk Gewest,Bruxelles - Brussel,Brussels,Brussels (its 19 municipalities)
+,5,Greater London,London,London,London (boroughs)
+,4,İstanbul,,,Istanbul (districts)
+,4,서울특별시,,,Seoul
+,4,부산광역시,,,Busan
+,4,北京市,,,Beijing
+,4,上海市,,,Shanghai
+,4,東京都,,,Tokyo (wards)
+,4,Ciudad de México,,,Mexico City (alcaldías)
+,4,Ciudad Autónoma de Buenos Aires,Buenos Aires,Buenos Aires,Buenos Aires (comunas)

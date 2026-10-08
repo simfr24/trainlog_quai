@@ -1,5 +1,5 @@
 # Stops and stations of every public transport mode
-nwr/railway=station,halt,tram_stop,subway_entrance
+nwr/railway=station,halt,tram_stop
 nwr/public_transport
 nwr/highway=bus_stop
 nwr/amenity=bus_station,ferry_terminal

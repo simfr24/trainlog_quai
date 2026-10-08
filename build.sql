@@ -9,9 +9,11 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS unaccent SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public;
 
+-- The functions are PARALLEL SAFE, as otherwise any query calling one runs on a single core.
+
 CREATE OR REPLACE FUNCTION public.fold(text) RETURNS text AS $$
     SELECT lower(public.unaccent('public.unaccent'::regdictionary, COALESCE($1, '')))
-$$ LANGUAGE sql IMMUTABLE;
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- What names and queries are compared on: folded, apostrophes dropped and other punctuation
 -- turned into single spaces, so "St. Gallen" is "st gallen" and "Lyon-Part-Dieu" has the
@@ -20,7 +22,26 @@ CREATE OR REPLACE FUNCTION public.search_fold(text) RETURNS text AS $$
     SELECT trim(regexp_replace(
         regexp_replace(public.fold($1), '[''’]', '', 'g'),
         '[^[:alnum:]]+', ' ', 'g'))
-$$ LANGUAGE sql IMMUTABLE;
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- A name without its quay: "Olav Kyrres gate (J)" is quay J of Olav Kyrres gate, as Norway
+-- names its stops, and "Royan - Gare (Quai C)" quay C of Royan - Gare. The quay becomes one
+-- of the station's tracks.
+CREATE OR REPLACE FUNCTION public.without_quay(text) RETURNS text AS $$
+    SELECT regexp_replace($1,
+        '\s+\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$', '')
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION public.quay_of(text) RETURNS text AS $$
+    SELECT substring($1 FROM
+        '\s\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$')
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- A name that is only a quay's code: "B3", "C11", "35". Such a stop is a quay of the station
+-- around it (Oslo bussterminal's), not a station of its own.
+CREATE OR REPLACE FUNCTION public.is_quay_code(text) RETURNS boolean AS $$
+    SELECT COALESCE($1 ~ '^([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,3}[A-Z]?)$', false)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- The station, stop or terminal itself, as opposed to its platforms and stop positions.
 CREATE OR REPLACE FUNCTION public.is_primary_stop(tags jsonb) RETURNS boolean AS $$
@@ -29,7 +50,8 @@ CREATE OR REPLACE FUNCTION public.is_primary_stop(tags jsonb) RETURNS boolean AS
             OR tags ->> 'amenity' IN ('bus_station', 'ferry_terminal')
             OR tags ->> 'aerialway' = 'station'
             OR tags ->> 'public_transport' = 'station') IS TRUE
-$$ LANGUAGE sql IMMUTABLE;
+       AND NOT is_quay_code(tags ->> 'name')
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- osm2pgsql indexes these by position only; /line looks routes and stops up by id.
 CREATE INDEX IF NOT EXISTS stops_osm_id_idx ON stops (osm_type, osm_id);
@@ -158,26 +180,35 @@ LEFT JOIN object_area oa USING (osm_type, osm_id);
 
 -- @step untagged stop positions
 -- Stop positions often carry no mode tag; inside a stop_area they belong to its stations.
+-- Not its entrances, which say nothing about where trains stop.
 INSERT INTO station_objects
 SELECT DISTINCT a.mode, a.key, s.osm_type, s.osm_id, s.tags, s.geom, false
 FROM (SELECT DISTINCT mode, key FROM station_objects WHERE key LIKE 'A%') a
 JOIN area_group ag ON ag.group_id = CASE WHEN a.key LIKE 'A%' THEN substr(a.key, 2)::bigint END
 JOIN rel_members rm ON rm.relation_id = ag.relation_id
 JOIN stops s ON s.osm_type = rm.osm_type AND s.osm_id = rm.osm_id
-WHERE NOT EXISTS (SELECT 1 FROM stop_modes sm WHERE sm.osm_type = s.osm_type AND sm.osm_id = s.osm_id);
+WHERE NOT EXISTS (SELECT 1 FROM stop_modes sm WHERE sm.osm_type = s.osm_type AND sm.osm_id = s.osm_id)
+  AND COALESCE(s.tags ->> 'railway', '') NOT IN ('subway_entrance', 'train_station_entrance')
+  AND NOT s.tags ? 'entrance';
 CREATE INDEX ON station_objects (mode, key);
 CREATE INDEX ON station_objects (osm_type, osm_id);
 
 -- @step merge nearby duplicates
 -- One station is often several same-named groups close together: a bus stop per side of
--- the street, or two station nodes with no shared stop_area. Clustered within 400m, on an
+-- the street, a quay each ("(E)", "(F)"), one with its town and one without ("Royan - Gare",
+-- "Gare"), or two station nodes with no shared stop_area. Clustered within 400m, on an
 -- equirectangular projection so that is metres at any latitude.
 ALTER TABLE station_objects ADD COLUMN source_key text;
 UPDATE station_objects SET source_key = key;
 
 WITH named AS (
     SELECT DISTINCT ON (o.mode, o.key)
-           o.mode, o.key, search_fold(COALESCE(o.tags ->> 'name', area.tags ->> 'name')) AS name, o.geom
+           o.mode, o.key,
+           -- Without a leading place either ("Royan - Gare (Quai C)" beside "Gare"): only
+           -- stops of one mode within 400m are compared.
+           search_fold(regexp_replace(without_quay(COALESCE(o.tags ->> 'name', area.tags ->> 'name')),
+                                      '^.+?\s+-\s+', '')) AS name,
+           o.geom
     FROM station_objects o
     LEFT JOIN rels area
       ON area.relation_id = CASE WHEN o.key LIKE 'A%' THEN substr(o.key, 2)::bigint END
@@ -259,9 +290,9 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        r.key,
        r.osm_type,
        r.osm_id,
-       COALESCE(r.tags ->> 'name', area.tags ->> 'name') AS name,
+       without_quay(COALESCE(r.tags ->> 'name', area.tags ->> 'name')) AS name,
        COALESCE((
-           SELECT jsonb_object_agg(k, v)
+           SELECT jsonb_object_agg(k, without_quay(v))
            FROM jsonb_each_text(COALESCE(area.tags, '{}') || r.tags) AS t(k, v)
            -- name:<language>[-<script>], not the likes of name:source or name:etymology.
            WHERE k ~ '^name:[a-z]{2,3}([-_][A-Za-z]{2,4})?$'
@@ -279,7 +310,9 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        NULL::jsonb AS tracks,
        NULL::text AS station_key,
        NULL::float8 AS weight,
-       NULL::text AS latin
+       NULL::text AS latin,
+       NULL::bigint[] AS boundary_ids,
+       NULL::boolean AS needs_place
 FROM rep r
 JOIN grouped g USING (mode, key)
 LEFT JOIN areas a USING (mode, key)
@@ -349,61 +382,84 @@ SELECT relation_id, admin_level, tags, ST_Subdivide(geom, 256) AS geom
 FROM boundaries;
 CREATE INDEX ON boundary_parts USING gist (geom);
 
+-- @step city overrides
+-- @python load_city_overrides
+
+
 -- @step country, region, city
 -- One lookup per station for every level at once. The country falls back on the region's
--- ISO3166-2 code ("FR-IDF"), for extracts that cut the country's own boundary.
+-- ISO3166-2 code ("FR-IDF"), for extracts that cut the country's own boundary. The city is
+-- the smallest boundary places.csv names (city_overrides), else the lowest municipality.
 UPDATE stations s SET
     country = COALESCE(p.country, p.region_country),
     region  = p.region,
-    city    = p.city
+    city    = p.city,
+    boundary_ids = p.boundary_ids
 FROM (
     SELECT s.station_id,
            max(upper(b.tags ->> 'ISO3166-1:alpha2')) FILTER (WHERE b.admin_level = 2) AS country,
            max(upper(left(b.tags ->> 'ISO3166-2', 2))) FILTER (WHERE b.admin_level = 4)
                AS region_country,
            max(b.tags ->> 'name') FILTER (WHERE b.admin_level = 4) AS region,
-           (array_agg(jsonb_strip_nulls(jsonb_build_object(
-                'name', b.tags ->> 'name', 'name:en', b.tags ->> 'name:en'))
-                ORDER BY b.admin_level DESC) FILTER (WHERE b.admin_level BETWEEN 6 AND 8))[1]
-               AS city
+           COALESCE(
+               (array_agg(jsonb_strip_nulls(jsonb_build_object(
+                    'name', COALESCE(co.name, b.tags ->> 'name'),
+                    'name:en', COALESCE(co.name_en, co.name, b.tags ->> 'name:en')))
+                    ORDER BY b.admin_level DESC) FILTER (WHERE co.relation_id IS NOT NULL))[1],
+               (array_agg(jsonb_strip_nulls(jsonb_build_object(
+                    'name', b.tags ->> 'name', 'name:en', b.tags ->> 'name:en'))
+                    ORDER BY b.admin_level DESC) FILTER (WHERE b.admin_level BETWEEN 6 AND 8))[1]
+           ) AS city,
+           array_agg(DISTINCT b.relation_id)
+               FILTER (WHERE b.admin_level BETWEEN 4 AND 8 OR co.relation_id IS NOT NULL)
+               AS boundary_ids
     FROM stations s
     JOIN boundary_parts b ON ST_Contains(b.geom, s.geom)
+    LEFT JOIN city_overrides co ON co.relation_id = b.relation_id
     GROUP BY s.station_id
 ) p
 WHERE s.station_id = p.station_id;
 
 
 -- @step station lines
--- Each line's point is a stop of that line, preferably its stop position, which sits on
--- the line's own track.
-WITH line_stops AS (
-    SELECT DISTINCT ON (st.station_id, lr.tags ->> 'ref')
+-- Each line calling at the station, at the middle of its stop positions there (else of its
+-- platforms): between its own tracks, as the line says which platforms but not which
+-- direction. Never on_track: one stop position is as often one direction mapped as a
+-- terminus.
+WITH line_objects AS (
+    SELECT DISTINCT ON (st.station_id, lr.tags ->> 'ref', o.osm_type, o.osm_id)
            st.station_id,
            lr.tags ->> 'ref' AS ref,
            lr.tags ->> 'colour' AS colour,
-           ST_Y(o.geom) AS lat,
-           ST_X(o.geom) AS lng
+           o.geom,
+           (o.tags ->> 'public_transport' = 'stop_position') IS TRUE AS is_stop_position
     FROM stations st
     JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
     JOIN rel_members rm ON rm.osm_type = o.osm_type AND rm.osm_id = o.osm_id
     JOIN line_routes lr ON lr.relation_id = rm.relation_id AND lr.mode = st.mode
-    ORDER BY st.station_id, lr.tags ->> 'ref',
-             (o.tags ->> 'public_transport' = 'stop_position') IS TRUE DESC
+    ORDER BY st.station_id, lr.tags ->> 'ref', o.osm_type, o.osm_id
+),
+line_points AS (
+    SELECT station_id, ref, max(colour) AS colour,
+           ST_Centroid(COALESCE(ST_Collect(geom) FILTER (WHERE is_stop_position), ST_Collect(geom))) AS geom
+    FROM line_objects
+    GROUP BY station_id, ref
 )
 UPDATE stations s SET lines = l.lines
 FROM (
     SELECT station_id,
-           jsonb_agg(jsonb_build_object('ref', ref, 'colour', colour, 'lat', lat, 'lng', lng)
+           jsonb_agg(jsonb_build_object('ref', ref, 'colour', colour,
+                                        'lat', ST_Y(geom), 'lng', ST_X(geom))
                      ORDER BY length(ref), ref) AS lines
-    FROM line_stops
+    FROM line_points
     GROUP BY station_id
 ) l
 WHERE s.station_id = l.station_id;
 
 
 -- @step station tracks
--- Where a vehicle calling at a given track stops, for rail modes, as timetables give their
--- tracks: [{ref, lat, lng, on_track}]. A stop position sits on the track itself; a platform
+-- Where a vehicle calling at a given track stops, as timetables give their tracks (a bus
+-- station's or a stop's quays alike): [{ref, lat, lng, on_track}]. A stop position sits on the track itself; a platform
 -- ("1;3") sits between its tracks, so it only stands in for a track with no stop position.
 WITH refs AS (
     SELECT st.station_id, n.ref,
@@ -412,13 +468,15 @@ WITH refs AS (
     FROM stations st
     JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
     CROSS JOIN LATERAL regexp_split_to_table(
-        COALESCE(o.tags ->> 'railway:track_ref', o.tags ->> 'local_ref', o.tags ->> 'ref'), ';') AS r
+        COALESCE(o.tags ->> 'railway:track_ref', o.tags ->> 'local_ref',
+                 CASE WHEN is_quay_code(o.tags ->> 'name') THEN o.tags ->> 'name' END,
+                 quay_of(o.tags ->> 'name'), o.tags ->> 'ref'), ';') AS r
     -- "Voie 2", "Gleis 7": the track is the part after the word.
     CROSS JOIN LATERAL (SELECT regexp_replace(trim(r),
         '^(voie|gleis|gl\.?|track|platform|quai|binario|v[ií]a|spoor|tor|peron)\s*', '', 'i') AS ref) n
-    WHERE st.mode IN ('train', 'metro', 'tram', 'funicular')
+    WHERE st.mode IN ('train', 'metro', 'tram', 'funicular', 'bus', 'ferry')
       AND (o.tags ->> 'public_transport' IN ('stop_position', 'platform')
-           OR o.tags ->> 'railway' = 'platform')
+           OR o.tags ->> 'railway' = 'platform' OR o.tags ->> 'highway' = 'bus_stop')
 ),
 best AS (
     SELECT DISTINCT ON (station_id, ref) station_id, ref, on_track, geom
@@ -442,6 +500,71 @@ WHERE s.station_id = t.station_id;
 
 -- @step latin names
 -- @python latin_names
+
+
+-- @step place names
+-- Whether a station's name needs its city to make sense: "Gare" in Royan is "Royan - Gare",
+-- "Gare de Lyon" in Paris "Paris - Gare de Lyon"; not when the name (or its Latin form)
+-- already says where it is, in any language and at any level from municipality to region:
+-- Brussels-Luxembourg sits in Ixelles, but says Brussels. A boundary's names count whole,
+-- split where bilingual ("Ixelles - Elsene"), and without generic words, so that "Région de
+-- Bruxelles-Capitale" says "bruxelles". "臺北" is the start of "臺北市".
+CREATE TABLE boundary_names AS
+SELECT DISTINCT relation_id, name
+FROM (
+    SELECT b.relation_id, search_fold(trim(part)) AS full_name,
+           trim(regexp_replace(regexp_replace(search_fold(trim(part)),
+               '\m(region|regione|capital|capitale|hoofdstedelijk|gewest|district|city|'
+               'ville|of|de|du|des|la|le|the|metropolitan|greater|gemeinde|stadt|kreis|landkreis|'
+               'oblast|raion|rayon|okrug|province|provincia|prefecture|municipality|municipio|'
+               'commune|county|kommune|fylke)\M', '', 'g'), '\s+', ' ', 'g')) AS bare_name
+    FROM boundaries b
+    LEFT JOIN city_overrides co USING (relation_id),
+         jsonb_each_text(b.tags || jsonb_strip_nulls(jsonb_build_object(
+             'override', co.name, 'override:en', co.name_en))) AS t(k, v),
+         regexp_split_to_table(t.v, '\s+-\s+|\s*/\s*|;') AS part
+    WHERE (b.admin_level BETWEEN 4 AND 8 OR co.relation_id IS NOT NULL)
+      AND (t.k = 'name' OR t.k ~ '^name:[a-z]{2,3}$' OR t.k LIKE 'override%'
+           OR t.k IN ('int_name', 'alt_name', 'official_name', 'short_name'))
+) n,
+-- "臺北市" without its last character is "臺北": a single non-Latin word less its suffix.
+LATERAL (VALUES (full_name), (bare_name),
+                (CASE WHEN full_name !~ '[ a-z]' AND length(full_name) >= 3
+                      THEN left(full_name, -1) END)) AS v(name)
+WHERE length(name) >= 2;
+CREATE INDEX ON boundary_names (relation_id, name);
+ANALYZE boundary_names;
+
+-- Every run of up to five consecutive words of the given names: what a boundary name, itself
+-- up to a few words, is compared to, as an exact match.
+CREATE OR REPLACE FUNCTION public.word_runs(VARIADIC names text[]) RETURNS SETOF text AS $$
+    SELECT array_to_string(w[i:j], ' ')
+    FROM unnest(names) AS t(name),
+         regexp_split_to_array(t.name, ' ') AS w,
+         generate_series(1, array_length(w, 1)) AS i,
+         generate_series(i, least(i + 4, array_length(w, 1))) AS j
+    WHERE t.name <> ''
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- Every run of every station against the names of its boundaries, as one join: computed
+-- first, as joining a function per station makes a lookup per station.
+CREATE TEMP TABLE station_runs AS
+SELECT st.station_id, bid, run
+FROM stations st,
+     unnest(st.boundary_ids) AS bid,
+     word_runs(search_fold(st.name), search_fold(st.latin)) AS run
+WHERE st.city IS NOT NULL;
+ANALYZE station_runs;
+
+UPDATE stations SET needs_place = city IS NOT NULL;
+UPDATE stations s SET needs_place = false
+FROM (
+    SELECT DISTINCT sr.station_id
+    FROM station_runs sr
+    JOIN boundary_names bn ON bn.relation_id = sr.bid AND bn.name = sr.run
+) said
+WHERE s.station_id = said.station_id;
+DROP TABLE station_runs;
 
 
 -- @step search names
@@ -473,11 +596,13 @@ FROM stations s,
      regexp_split_to_table(n.v, ';') AS part
 WHERE trim(part) <> '';
 
+-- Both ways round, as people type either: "villeneuve bordeneuve", "bordeneuve villeneuve".
 INSERT INTO station_names (station_id, mode, name, city_prefixed)
-SELECT DISTINCT n.station_id, n.mode, c.city || ' ' || n.name, true
+SELECT DISTINCT n.station_id, n.mode, v.name, true
 FROM station_names n
 JOIN stations s USING (station_id)
 CROSS JOIN LATERAL (VALUES (s.city ->> 'name'), (s.city ->> 'name:en')) AS c(city)
+CROSS JOIN LATERAL (VALUES (c.city || ' ' || n.name), (n.name || ' ' || c.city)) AS v(name)
 WHERE c.city IS NOT NULL AND n.folded NOT LIKE '%' || search_fold(c.city) || '%';
 
 CREATE INDEX ON station_names USING gin (folded gin_trgm_ops);

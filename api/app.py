@@ -14,7 +14,7 @@ pool = ConnectionPool(os.environ["DATABASE_URL"], kwargs={"row_factory": dict_ro
 COLUMNS = """
     s.station_id, s.station_key, s.mode, s.osm_type, s.osm_id, s.name, s.latin, s.names,
     s.city, s.region, s.country, ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
-    s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight
+    s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight, s.needs_place
 """
 
 
@@ -40,6 +40,16 @@ def with_labels(rows):
     return rows
 
 
+# How much distance (ln(1 + km)) weighs against importance (weights run from about 1 for a
+# bus stop to 15 for a major terminus): 1 km away costs 1.4, 10 km 4.8, 500 km 12.4.
+DISTANCE_PENALTY = 2.0
+# What matching a station's whole name adds to its importance.
+EXACT_BONUS = 2.0
+# The word similarity a fuzzy match (no name starting with the query) needs to be offered;
+# the index finds candidates from pg_trgm's 0.6.
+FUZZY_MIN = 0.7
+
+
 @app.get("/search")
 def search():
     q = request.args.get("q", "").strip()
@@ -50,6 +60,9 @@ def search():
         "q": q,
         "mode": mode,
         "limit": min(request.args.get("limit", 10, type=int), 50),
+        "distance_penalty": DISTANCE_PENALTY,
+        "exact_bonus": EXACT_BONUS,
+        "fuzzy_min": FUZZY_MIN,
         **point_params(),
     }
     # Under three letters nearly every name shares a trigram with the query, so only
@@ -57,41 +70,57 @@ def search():
     # that mode's partition.
     fuzzy = "OR search_fold(%(q)s) <%% n.folded" if len(q) >= 3 else ""
     mode_filter = "AND n.mode = %(mode)s" if mode else ""
-    # Tiers, best first: the whole name; the start of one of the station's names; the start
-    # of a word in one ("montparnasse" in "Gare Montparnasse"); the start of a city-prefixed
-    # name ("berlin" in "Berlin Albrechtshof"); anything else matching. Within a tier the
-    # more important station comes first, but fuzzy matches go by score before that.
+    # Tiers, best first: whole words starting one of the station's names, city-prefixed or
+    # not ("agen" in "Agen Gare", not in "Agence Commerciale": typing a city's name asks for
+    # its stations); the start of one of the station's names (the whole name counts
+    # EXACT_BONUS more importance, not a tier of its own: "Oslo", a stop in Alsace, is no
+    # better an answer than Oslo bussterminal); the start of a word in one ("montparnasse" in
+    # "Gare Montparnasse"); the start of a city-prefixed name ("berlin" in "Berlin
+    # Albrechtshof"); anything else matching. Within a tier the more important station comes
+    # first, but fuzzy matches go by score before that. Given a
+    # position (lat, lon), distance counts against importance: of the many stops named
+    # "Poste", the one nearby, not the slightly busier one across the country.
     rows = query(
         f"""
         WITH matched AS (
             SELECT n.station_id, n.name,
                    CASE
+                       WHEN n.folded = search_fold(%(q)s)
+                            OR n.folded LIKE search_fold(%(q)s) || ' %%' THEN 0
                        WHEN n.city_prefixed THEN
                            CASE WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 3 ELSE 4 END
-                       WHEN n.folded = search_fold(%(q)s) THEN 0
                        WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 1
                        WHEN ' ' || n.folded LIKE '%% ' || search_fold(%(q)s) || '%%' THEN 2
                        ELSE 4
                    END AS tier,
-                   word_similarity(search_fold(%(q)s), n.folded) AS score
+                   word_similarity(search_fold(%(q)s), n.folded) AS score,
+                   NOT n.city_prefixed AND n.folded = search_fold(%(q)s) AS exact
             FROM station_names n
             WHERE (n.folded LIKE search_fold(%(q)s) || '%%' {fuzzy}) {mode_filter}
         ),
         best AS (
             SELECT station_id, min(tier) AS tier, round(max(score)::numeric, 1) AS score,
+                   bool_or(exact) AS exact,
                    (array_agg(name ORDER BY tier, score DESC, length(name)))[1] AS matched
             FROM matched
             GROUP BY station_id
         )
-        SELECT {COLUMNS}, b.matched
+        SELECT {COLUMNS}, b.matched, b.tier, b.score::float8 AS score,
+               d.km AS distance_km
         FROM best b
         JOIN stations s USING (station_id)
+        CROSS JOIN LATERAL (
+            SELECT CASE WHEN %(lat)s::float8 IS NOT NULL THEN
+                ST_DistanceSphere(s.geom, ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326)) / 1000
+            END AS km
+        ) d
+        -- A fuzzy match only when close: at 0.6, "kiev" finds Hakka romanisations ("kieuˇ")
+        -- and "issigeac" finds Issigau, where nothing but a fallback should answer.
+        WHERE b.tier < 4 OR b.score >= %(fuzzy_min)s
         ORDER BY b.tier,
                  CASE WHEN b.tier = 4 THEN b.score END DESC NULLS FIRST,
-                 s.weight DESC,
-                 CASE WHEN %(lat)s::float8 IS NULL THEN 0
-                      ELSE s.geom <-> ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326)
-                 END,
+                 s.weight + CASE WHEN b.exact THEN %(exact_bonus)s ELSE 0 END
+                     - %(distance_penalty)s * ln(1 + COALESCE(d.km, 0)) DESC,
                  s.name
         LIMIT %(limit)s
         """,

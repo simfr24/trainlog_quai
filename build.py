@@ -10,6 +10,7 @@ of a "-- @python <function>" line runs that function of this file instead. The E
 from the previous successful run's step timings, scaled by the input file's size.
 """
 
+import csv
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from latin import latin_name
 BUILD_SQL = "/data/build.sql"
 INPUT = "/data/filtered.osm.pbf"
 TIMINGS = "/data/.build_timings.json"
+PLACES = "/data/places.csv"
 RAW_TABLES = ("stops", "rels", "boundaries")
 
 # For this session only: the API's connections keep the server defaults.
@@ -60,6 +62,40 @@ def latin_names(conn):
     conn.execute("UPDATE stations s SET latin = l.latin FROM latin l"
                  " WHERE s.station_id = l.station_id")
     conn.execute("DROP TABLE latin")
+
+
+def load_city_overrides(conn):
+    """The boundaries that are the city of the stations inside them, and their names: those
+    places.csv lists (by relation id, or by admin level and name), then those tagged
+    place=city at region level or below."""
+    conn.execute("DROP TABLE IF EXISTS city_overrides")
+    conn.execute("CREATE TABLE city_overrides (relation_id bigint PRIMARY KEY, name text, name_en text)")
+    with open(PLACES, encoding="utf-8") as f:
+        rows = list(csv.DictReader(line for line in f if line.strip() and not line.startswith("#")))
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO city_overrides
+            SELECT relation_id, %(name)s, %(name_en)s FROM boundaries
+            WHERE relation_id = %(relation_id)s
+               OR (%(relation_id)s IS NULL AND admin_level = %(admin_level)s
+                   AND tags ->> 'name' = %(boundary_name)s)
+            ON CONFLICT DO NOTHING
+            """,
+            {
+                "relation_id": int(row["relation_id"]) if row["relation_id"] else None,
+                "admin_level": int(row["admin_level"]) if row["admin_level"] else None,
+                "boundary_name": row["boundary_name"] or None,
+                "name": row["name"] or None,
+                "name_en": row["name_en"] or None,
+            },
+        )
+    conn.execute("""
+        INSERT INTO city_overrides
+        SELECT relation_id, NULL, NULL FROM boundaries
+        WHERE admin_level BETWEEN 4 AND 7 AND tags ->> 'place' = 'city'
+        ON CONFLICT DO NOTHING
+    """)
 
 
 def live_has(conn, table, column=None):
