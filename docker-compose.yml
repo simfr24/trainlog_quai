@@ -4,7 +4,11 @@ services:
   db:
     image: postgis/postgis:17-3.5
     # Sized for building the world; the build session raises its own memory further.
-    command: postgres -c shared_buffers=4GB -c max_wal_size=16GB -c max_parallel_workers=8
+    # shared_buffers holds what searches read (about 4GB for the world), and pg_prewarm
+    # reloads it after a restart, as the disk is a hard drive.
+    command: >-
+      postgres -c shared_buffers=${QUAI_SHARED_BUFFERS:-8GB} -c max_wal_size=16GB
+      -c max_parallel_workers=8 -c shared_preload_libraries=pg_prewarm
     # Parallel queries share memory through /dev/shm, 64MB by default.
     shm_size: 4gb
     environment:
@@ -16,7 +20,8 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "quai"]
+      # Over TCP: on first start the init server answers on the socket only, then restarts.
+      test: ["CMD", "pg_isready", "-U", "quai", "-h", "127.0.0.1"]
       interval: 5s
       retries: 20
     restart: always

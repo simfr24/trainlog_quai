@@ -12,9 +12,9 @@ app = Flask(__name__)
 pool = ConnectionPool(os.environ["DATABASE_URL"], kwargs={"row_factory": dict_row}, open=True)
 
 COLUMNS = """
-    s.station_id, s.mode, s.osm_type, s.osm_id, s.name, s.names, s.city, s.region, s.country,
-    ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
-    s.wikidata, s.uic_ref, s.objects, s.lines
+    s.station_id, s.station_key, s.mode, s.osm_type, s.osm_id, s.name, s.latin, s.names,
+    s.city, s.region, s.country, ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
+    s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight
 """
 
 
@@ -28,35 +28,67 @@ def point_params():
     return {"lat": lat, "lon": lon}
 
 
+def with_labels(rows):
+    """Add each station's `label`: its name in `lang` when asked for and mapped, else its
+    international Latin-script name."""
+    lang = request.args.get("lang")
+    keys = [f"name:{lang}", f"name:{lang.split('-')[0]}"] if lang else []
+    for row in rows:
+        names = row["names"] or {}
+        row["label"] = next((names[k] for k in keys if names.get(k)), None) \
+            or row["latin"] or row["name"]
+    return rows
+
+
 @app.get("/search")
 def search():
     q = request.args.get("q", "").strip()
     if len(q) < 2:
         return jsonify(stations=[])
+    mode = request.args.get("mode")
     params = {
         "q": q,
-        "mode": request.args.get("mode"),
+        "mode": mode,
         "limit": min(request.args.get("limit", 10, type=int), 50),
         **point_params(),
     }
-    # Prefix matches first, then word similarity; a given position breaks ties by distance.
-    # Word similarity scores the typed text against the best-matching part of a name, as typing
-    # is; whole-name similarity lets a short word like "stavanger" match every name sharing
-    # " st" or "er ", which the index then has to recheck by the million.
+    # Under three letters nearly every name shares a trigram with the query, so only
+    # prefixes count. A literal mode, not "mode IS NULL OR", lets the planner read only
+    # that mode's partition.
+    fuzzy = "OR search_fold(%(q)s) <%% n.folded" if len(q) >= 3 else ""
+    mode_filter = "AND n.mode = %(mode)s" if mode else ""
+    # Tiers, best first: the whole name; the start of one of the station's names; the start
+    # of a word in one ("montparnasse" in "Gare Montparnasse"); the start of a city-prefixed
+    # name ("berlin" in "Berlin Albrechtshof"); anything else matching. Within a tier the
+    # more important station comes first, but fuzzy matches go by score before that.
     rows = query(
         f"""
-        SELECT {COLUMNS}
-        FROM (
-            SELECT n.station_id,
-                   bool_or(n.folded LIKE fold(%(q)s) || '%%') AS prefix,
-                   max(word_similarity(fold(%(q)s), n.folded)) AS score
+        WITH matched AS (
+            SELECT n.station_id, n.name,
+                   CASE
+                       WHEN n.city_prefixed THEN
+                           CASE WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 3 ELSE 4 END
+                       WHEN n.folded = search_fold(%(q)s) THEN 0
+                       WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 1
+                       WHEN ' ' || n.folded LIKE '%% ' || search_fold(%(q)s) || '%%' THEN 2
+                       ELSE 4
+                   END AS tier,
+                   word_similarity(search_fold(%(q)s), n.folded) AS score
             FROM station_names n
-            WHERE n.folded LIKE fold(%(q)s) || '%%' OR fold(%(q)s) <%% n.folded
-            GROUP BY n.station_id
-        ) m
+            WHERE (n.folded LIKE search_fold(%(q)s) || '%%' {fuzzy}) {mode_filter}
+        ),
+        best AS (
+            SELECT station_id, min(tier) AS tier, round(max(score)::numeric, 1) AS score,
+                   (array_agg(name ORDER BY tier, score DESC, length(name)))[1] AS matched
+            FROM matched
+            GROUP BY station_id
+        )
+        SELECT {COLUMNS}, b.matched
+        FROM best b
         JOIN stations s USING (station_id)
-        WHERE %(mode)s::text IS NULL OR s.mode = %(mode)s
-        ORDER BY m.prefix DESC, m.score DESC,
+        ORDER BY b.tier,
+                 CASE WHEN b.tier = 4 THEN b.score END DESC NULLS FIRST,
+                 s.weight DESC,
                  CASE WHEN %(lat)s::float8 IS NULL THEN 0
                       ELSE s.geom <-> ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326)
                  END,
@@ -65,7 +97,41 @@ def search():
         """,
         params,
     )
-    return jsonify(stations=rows)
+    return jsonify(stations=with_labels(rows))
+
+
+@app.get("/station/<mode>/<key>")
+def station(mode, key):
+    """The station a key Trainlog stored leads to, following redirects of vanished keys."""
+    rows = query(
+        f"""
+        SELECT {COLUMNS}
+        FROM stations s
+        WHERE s.mode = %(mode)s
+          AND s.station_key IN (%(key)s, (SELECT new_key FROM key_redirects
+                                          WHERE mode = %(mode)s AND old_key = %(key)s))
+        ORDER BY s.station_key = %(key)s DESC
+        LIMIT 1
+        """,
+        {"mode": mode, "key": key},
+    )
+    if not rows:
+        return jsonify(error="unknown station"), 404
+    station = with_labels(rows)[0]
+    # Every OSM object grouped into the station, with its tags: what the grouping was made of.
+    if request.args.get("objects"):
+        station["osm_objects"] = query(
+            """
+            SELECT o.osm_type, o.osm_id, o.is_primary, o.tags,
+                   ST_Y(o.geom) AS lat, ST_X(o.geom) AS lng
+            FROM stations s
+            JOIN station_objects o ON o.mode = s.mode AND o.key = s.key
+            WHERE s.station_id = %(station_id)s
+            ORDER BY o.is_primary DESC, o.osm_type, o.osm_id
+            """,
+            {"station_id": station["station_id"]},
+        )
+    return jsonify(station=station)
 
 
 @app.get("/reverse")
@@ -89,7 +155,7 @@ def reverse():
         """,
         params,
     )
-    return jsonify(stations=rows)
+    return jsonify(stations=with_labels(rows))
 
 
 @app.get("/object/<osm_type>/<int:osm_id>")
@@ -103,7 +169,7 @@ def osm_object(osm_type, osm_id):
         """,
         {"type": osm_type.upper(), "id": osm_id},
     )
-    return jsonify(stations=rows)
+    return jsonify(stations=with_labels(rows))
 
 
 def station_for_object(ref, mode):

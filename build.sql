@@ -13,6 +13,15 @@ CREATE OR REPLACE FUNCTION public.fold(text) RETURNS text AS $$
     SELECT lower(public.unaccent('public.unaccent'::regdictionary, COALESCE($1, '')))
 $$ LANGUAGE sql IMMUTABLE;
 
+-- What names and queries are compared on: folded, apostrophes dropped and other punctuation
+-- turned into single spaces, so "St. Gallen" is "st gallen" and "Lyon-Part-Dieu" has the
+-- word "part". A separate function from fold(), which the live tables were built with.
+CREATE OR REPLACE FUNCTION public.search_fold(text) RETURNS text AS $$
+    SELECT trim(regexp_replace(
+        regexp_replace(public.fold($1), '[''’]', '', 'g'),
+        '[^[:alnum:]]+', ' ', 'g'))
+$$ LANGUAGE sql IMMUTABLE;
+
 -- The station, stop or terminal itself, as opposed to its platforms and stop positions.
 CREATE OR REPLACE FUNCTION public.is_primary_stop(tags jsonb) RETURNS boolean AS $$
     SELECT (tags ->> 'railway' IN ('station', 'halt', 'tram_stop')
@@ -26,7 +35,7 @@ $$ LANGUAGE sql IMMUTABLE;
 CREATE INDEX IF NOT EXISTS stops_osm_id_idx ON stops (osm_type, osm_id);
 CREATE INDEX IF NOT EXISTS rels_relation_id_idx ON rels (relation_id);
 
-DROP TABLE IF EXISTS station_names, stations, station_objects, stop_modes, area_group, line_routes,
+DROP TABLE IF EXISTS key_redirects, station_names, stations, station_objects, stop_modes, area_group, line_routes,
     rel_members, route_stops, boundary_parts;
 
 
@@ -168,7 +177,7 @@ UPDATE station_objects SET source_key = key;
 
 WITH named AS (
     SELECT DISTINCT ON (o.mode, o.key)
-           o.mode, o.key, fold(COALESCE(o.tags ->> 'name', area.tags ->> 'name')) AS name, o.geom
+           o.mode, o.key, search_fold(COALESCE(o.tags ->> 'name', area.tags ->> 'name')) AS name, o.geom
     FROM station_objects o
     LEFT JOIN rels area
       ON area.relation_id = CASE WHEN o.key LIKE 'A%' THEN substr(o.key, 2)::bigint END
@@ -254,8 +263,10 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        COALESCE((
            SELECT jsonb_object_agg(k, v)
            FROM jsonb_each_text(COALESCE(area.tags, '{}') || r.tags) AS t(k, v)
-           WHERE k LIKE 'name:%'
-              OR k IN ('name', 'int_name', 'alt_name', 'official_name', 'short_name', 'loc_name')
+           -- name:<language>[-<script>], not the likes of name:source or name:etymology.
+           WHERE k ~ '^name:[a-z]{2,3}([-_][A-Za-z]{2,4})?$'
+              OR k IN ('name', 'int_name', 'alt_name', 'official_name', 'short_name',
+                       'loc_name', 'nat_name', 'reg_name', 'old_name')
        ), '{}') AS names,
        g.wikidata,
        g.uic_ref,
@@ -264,7 +275,11 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        NULL::text AS country,
        NULL::text AS region,
        NULL::jsonb AS city,
-       NULL::jsonb AS lines
+       NULL::jsonb AS lines,
+       NULL::jsonb AS tracks,
+       NULL::text AS station_key,
+       NULL::float8 AS weight,
+       NULL::text AS latin
 FROM rep r
 JOIN grouped g USING (mode, key)
 LEFT JOIN areas a USING (mode, key)
@@ -277,6 +292,53 @@ CREATE INDEX ON stations USING gist (geom);
 CREATE INDEX ON stations USING gist ((geom::geography));
 CREATE INDEX ON stations USING gin (objects jsonb_path_ops);
 CREATE INDEX ON stations (mode);
+CREATE INDEX ON stations (mode, key);
+
+
+-- @step station keys
+-- The key Trainlog stores, unique within the mode: the wikidata item, else the UIC code,
+-- else the representative object. The first two survive OSM remapping a station's objects;
+-- key_redirects (see build.py) covers the rest.
+UPDATE stations s SET station_key = c.key
+FROM (
+    SELECT DISTINCT ON (station_id) station_id, key
+    FROM (
+        SELECT s.station_id, k.priority, k.key,
+               count(*) OVER (PARTITION BY s.mode, k.key) AS holders
+        FROM stations s
+        CROSS JOIN LATERAL (VALUES
+            (1, CASE WHEN s.wikidata ~ '^Q[0-9]+$' THEN s.wikidata END),
+            (2, 'UIC' || NULLIF(trim(s.uic_ref), '')),
+            (3, s.osm_type || s.osm_id)
+        ) AS k(priority, key)
+        WHERE k.key IS NOT NULL
+    ) candidates
+    WHERE holders = 1
+    ORDER BY station_id, priority
+) c
+WHERE s.station_id = c.station_id;
+ALTER TABLE stations ALTER COLUMN station_key SET NOT NULL;
+CREATE UNIQUE INDEX ON stations (mode, station_key);
+
+
+-- @step weights
+-- How much a station matters, to order stations matching a search equally well: the routes
+-- calling at it, its number of objects, and having a wikidata item. Gare de Lyon over a halt.
+UPDATE stations SET weight = ln(1 + jsonb_array_length(objects))::float8
+                           + CASE WHEN wikidata IS NOT NULL THEN 0.5 ELSE 0 END;
+UPDATE stations s SET weight = s.weight + 2 * ln(1 + r.routes)::float8
+FROM (
+    SELECT st.station_id, count(DISTINCT rs.relation_id) AS routes
+    FROM route_stops rs
+    JOIN rels r USING (relation_id)
+    JOIN (VALUES ('train', 'train'), ('metro', 'subway'), ('metro', 'light_rail'),
+                 ('metro', 'monorail'), ('tram', 'tram'), ('tram', 'light_rail')) AS m(mode, route)
+      ON m.route = r.tags ->> 'route'
+    JOIN station_objects o ON o.osm_type = rs.osm_type AND o.osm_id = rs.osm_id AND o.mode = m.mode
+    JOIN stations st ON st.mode = o.mode AND st.key = o.key
+    GROUP BY st.station_id
+) r
+WHERE s.station_id = r.station_id;
 
 
 -- @step boundary pieces
@@ -339,23 +401,85 @@ FROM (
 WHERE s.station_id = l.station_id;
 
 
+-- @step station tracks
+-- Where a vehicle calling at a given track stops, for rail modes, as timetables give their
+-- tracks: [{ref, lat, lng, on_track}]. A stop position sits on the track itself; a platform
+-- ("1;3") sits between its tracks, so it only stands in for a track with no stop position.
+WITH refs AS (
+    SELECT st.station_id, n.ref,
+           o.tags ->> 'public_transport' = 'stop_position' IS TRUE AS on_track,
+           o.geom, st.geom AS station_geom
+    FROM stations st
+    JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+    CROSS JOIN LATERAL regexp_split_to_table(
+        COALESCE(o.tags ->> 'railway:track_ref', o.tags ->> 'local_ref', o.tags ->> 'ref'), ';') AS r
+    -- "Voie 2", "Gleis 7": the track is the part after the word.
+    CROSS JOIN LATERAL (SELECT regexp_replace(trim(r),
+        '^(voie|gleis|gl\.?|track|platform|quai|binario|v[ií]a|spoor|tor|peron)\s*', '', 'i') AS ref) n
+    WHERE st.mode IN ('train', 'metro', 'tram', 'funicular')
+      AND (o.tags ->> 'public_transport' IN ('stop_position', 'platform')
+           OR o.tags ->> 'railway' = 'platform')
+),
+best AS (
+    SELECT DISTINCT ON (station_id, ref) station_id, ref, on_track, geom
+    FROM refs
+    -- Shaped like a track: "7", "112", "12a", "A", "M3". Leaves out the stop codes some tram and
+    -- metro stops carry as ref ("41135", "275A") and words ("Entrée").
+    WHERE ref ~ '^([0-9]{1,3}|[0-9]{1,2}[A-Za-z]|[A-Za-z]{1,2}[0-9]{0,2})$'
+    ORDER BY station_id, ref, on_track DESC, geom <-> station_geom
+)
+UPDATE stations s SET tracks = t.tracks
+FROM (
+    SELECT station_id,
+           jsonb_agg(jsonb_build_object('ref', ref, 'lat', round(ST_Y(geom)::numeric, 6),
+                                        'lng', round(ST_X(geom)::numeric, 6), 'on_track', on_track)
+                     ORDER BY length(ref), ref) AS tracks
+    FROM best
+    GROUP BY station_id
+) t
+WHERE s.station_id = t.station_id;
+
+
+-- @step latin names
+-- @python latin_names
+
+
 -- @step search names
--- Every spelling to search on, plus each prefixed with its city ("Paris Gare de Lyon").
-CREATE TABLE station_names AS
-SELECT DISTINCT s.station_id, trim(part) AS name
+-- Every spelling to search on, one partition per mode so that a search reads its mode's
+-- names only: bus stops are nine stations in ten. Each name is also prefixed with its city
+-- ("Paris Gare de Lyon"), marked as such since it matches every station of the city.
+CREATE TABLE station_names (
+    station_id    integer NOT NULL,
+    mode          text NOT NULL,
+    name          text NOT NULL,
+    city_prefixed boolean NOT NULL,
+    folded        text GENERATED ALWAYS AS (search_fold(name)) STORED
+) PARTITION BY LIST (mode);
+
+DO $$
+DECLARE
+    m text;
+BEGIN
+    FOR m IN SELECT DISTINCT mode FROM stations LOOP
+        EXECUTE format('CREATE TABLE %I PARTITION OF station_names FOR VALUES IN (%L)',
+                       'station_names_' || m, m);
+    END LOOP;
+END $$;
+
+INSERT INTO station_names (station_id, mode, name, city_prefixed)
+SELECT DISTINCT s.station_id, s.mode, trim(part), false
 FROM stations s,
-     jsonb_each_text(s.names) AS n(k, v),
+     jsonb_each_text(s.names || jsonb_build_object('latin', s.latin)) AS n(k, v),
      regexp_split_to_table(n.v, ';') AS part
 WHERE trim(part) <> '';
 
-INSERT INTO station_names
-SELECT DISTINCT n.station_id, c.city || ' ' || n.name
+INSERT INTO station_names (station_id, mode, name, city_prefixed)
+SELECT DISTINCT n.station_id, n.mode, c.city || ' ' || n.name, true
 FROM station_names n
 JOIN stations s USING (station_id)
 CROSS JOIN LATERAL (VALUES (s.city ->> 'name'), (s.city ->> 'name:en')) AS c(city)
-WHERE c.city IS NOT NULL AND fold(n.name) NOT LIKE '%' || fold(c.city) || '%';
+WHERE c.city IS NOT NULL AND n.folded NOT LIKE '%' || search_fold(c.city) || '%';
 
-ALTER TABLE station_names ADD COLUMN folded text GENERATED ALWAYS AS (fold(name)) STORED;
 CREATE INDEX ON station_names USING gin (folded gin_trgm_ops);
 CREATE INDEX ON station_names (folded text_pattern_ops);
 CREATE INDEX ON station_names (station_id);

@@ -2,3 +2,5 @@
 .build_timings.json
 __pycache__/
 *.tmp
+downloads/
+filtered/
