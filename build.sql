@@ -37,10 +37,17 @@ CREATE OR REPLACE FUNCTION public.quay_of(text) RETURNS text AS $$
         '\s\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$')
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
--- A name that is only a quay's code: "B3", "C11", "35". Such a stop is a quay of the station
--- around it (Oslo bussterminal's), not a station of its own.
+-- The code of a stop named only as a quay: "B3", "C11", "35", "Quai n°10", "Bay 12". Such a
+-- stop is a quay of the station around it (Oslo bussterminal's, Agen's), not a station.
+CREATE OR REPLACE FUNCTION public.quay_code(text) RETURNS text AS $$
+    SELECT (regexp_match($1,
+        '^(?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme|[Pp]erron|'
+        '[Bb]ahnsteig|[Aa]ndén|[Bb]inario|[Ss]por|[Ll]aituri)\s*(?:n[°o]\.?\s*)?)?'
+        '([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,3}[A-Z]?)$'))[1]
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 CREATE OR REPLACE FUNCTION public.is_quay_code(text) RETURNS boolean AS $$
-    SELECT COALESCE($1 ~ '^([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,3}[A-Z]?)$', false)
+    SELECT quay_code($1) IS NOT NULL
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
 -- The station, stop or terminal itself, as opposed to its platforms and stop positions.
@@ -57,7 +64,7 @@ $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 CREATE INDEX IF NOT EXISTS stops_osm_id_idx ON stops (osm_type, osm_id);
 CREATE INDEX IF NOT EXISTS rels_relation_id_idx ON rels (relation_id);
 
-DROP TABLE IF EXISTS key_redirects, station_names, stations, station_objects, stop_modes, area_group, line_routes,
+DROP TABLE IF EXISTS platform_stops, key_redirects, station_names, stations, station_objects, stop_modes, area_group, line_routes,
     rel_members, route_stops, boundary_parts;
 
 
@@ -136,9 +143,12 @@ CREATE TABLE stop_modes AS
 SELECT s.osm_type, s.osm_id, m.mode
 FROM stops s
 CROSS JOIN LATERAL (VALUES
+    -- train=yes on a metro station (Paris's Gare d'Austerlitz, Bérault) is mapper noise: the
+    -- trains stop at the station beside it. Tram-trains (station=light_rail) keep it.
     ('train',     s.tags ->> 'railway' IN ('station', 'halt')
                   AND COALESCE(s.tags ->> 'station', 'train') = 'train'
-                  OR s.tags ->> 'train' = 'yes'),
+                  OR s.tags ->> 'train' = 'yes'
+                  AND COALESCE(s.tags ->> 'station', '') NOT IN ('subway', 'monorail')),
     ('metro',     s.tags ->> 'station' IN ('subway', 'light_rail', 'monorail')
                   OR s.tags ->> 'subway' = 'yes' OR s.tags ->> 'light_rail' = 'yes'
                   OR s.tags ->> 'monorail' = 'yes'),
@@ -261,13 +271,40 @@ UPDATE station_objects o SET key = n.station_key
 FROM nearest n
 WHERE o.mode = n.mode AND o.key = n.key;
 
+-- @step bus stations
+-- A bus station and the stops around it are one station, whatever their names ("Gare SNCF"
+-- beside "Gare Routière Agen"): each bus stop group within 80m of a bus station joins the
+-- nearest. 80m keeps the stops across the street ("Gare - Carnot") apart.
+WITH bus_stations AS (
+    SELECT DISTINCT ON (key) key, geom
+    FROM station_objects
+    WHERE mode = 'bus' AND is_primary AND tags ->> 'amenity' = 'bus_station'
+    ORDER BY key, osm_type, osm_id
+),
+absorbed AS (
+    SELECT DISTINCT ON (g.key) g.key, b.key AS into_key
+    FROM bus_stations b
+    JOIN station_objects g
+      ON g.mode = 'bus' AND g.is_primary AND g.key <> b.key
+     AND g.geom && ST_Expand(b.geom, 0.002)
+     AND ST_DWithin(g.geom::geography, b.geom::geography, 80)
+    WHERE NOT EXISTS (SELECT 1 FROM bus_stations x WHERE x.key = g.key)
+    ORDER BY g.key, ST_Distance(g.geom, b.geom)
+)
+UPDATE station_objects o SET key = a.into_key
+FROM absorbed a
+WHERE o.mode = 'bus' AND o.key = a.key;
+
+
 -- @step stations
 CREATE TABLE stations AS
 WITH rep AS (
     SELECT DISTINCT ON (mode, key) mode, key, osm_type, osm_id, tags, geom
     FROM station_objects
     WHERE is_primary
-    ORDER BY mode, key, (tags ? 'name') DESC, osm_type, osm_id
+    -- A bus station over the stops it gathers.
+    ORDER BY mode, key, (tags ->> 'amenity' = 'bus_station') IS TRUE DESC, (tags ? 'name') DESC,
+             osm_type, osm_id
 ),
 grouped AS (
     SELECT mode, key,
@@ -457,20 +494,63 @@ FROM (
 WHERE s.station_id = l.station_id;
 
 
+-- @step platform stop positions
+-- A platform numbered for one track, whose stop position on that track is unnumbered (Myrdal's
+-- "2"): its track can sit on the stop position. Only when unambiguous: each is the other's
+-- nearest, within 30m, with the platform's next stop position at least half as far again.
+-- Not a "1;2" island platform, which cannot say which of its two stop positions is which.
+CREATE TABLE platform_stops AS
+WITH platforms AS (
+    SELECT st.station_id, o.osm_type, o.osm_id, o.geom
+    FROM stations st
+    JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+    WHERE st.mode IN ('train', 'metro', 'tram', 'funicular')
+      AND (o.tags ->> 'public_transport' = 'platform' OR o.tags ->> 'railway' = 'platform')
+      AND COALESCE(o.tags ->> 'railway:track_ref', o.tags ->> 'local_ref', o.tags ->> 'ref') ~ '^[^;]+$'
+),
+stops AS (
+    SELECT st.station_id, o.osm_type, o.osm_id, o.geom
+    FROM stations st
+    JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+    WHERE st.mode IN ('train', 'metro', 'tram', 'funicular')
+      AND o.tags ->> 'public_transport' = 'stop_position'
+      AND NOT o.tags ?| array['railway:track_ref', 'local_ref', 'ref']
+),
+pairs AS (
+    SELECT p.station_id, p.osm_type, p.osm_id, s.geom AS stop_geom,
+           ST_Distance(p.geom::geography, s.geom::geography) AS d,
+           row_number() OVER (PARTITION BY p.station_id, p.osm_type, p.osm_id ORDER BY p.geom <-> s.geom) AS for_platform,
+           row_number() OVER (PARTITION BY s.station_id, s.osm_type, s.osm_id ORDER BY p.geom <-> s.geom) AS for_stop
+    FROM platforms p
+    JOIN stops s USING (station_id)
+)
+SELECT a.station_id, a.osm_type, a.osm_id, a.stop_geom
+FROM pairs a
+LEFT JOIN pairs b ON b.station_id = a.station_id AND b.osm_type = a.osm_type AND b.osm_id = a.osm_id
+                 AND b.for_platform = 2
+WHERE a.for_platform = 1 AND a.for_stop = 1 AND a.d <= 30 AND (b.d IS NULL OR b.d >= 1.5 * a.d);
+CREATE INDEX ON platform_stops (station_id, osm_type, osm_id);
+
+
 -- @step station tracks
 -- Where a vehicle calling at a given track stops, as timetables give their tracks (a bus
 -- station's or a stop's quays alike): [{ref, lat, lng, on_track}]. A stop position sits on the track itself; a platform
 -- ("1;3") sits between its tracks, so it only stands in for a track with no stop position.
 WITH refs AS (
     SELECT st.station_id, n.ref,
-           o.tags ->> 'public_transport' = 'stop_position' IS TRUE AS on_track,
-           o.geom, st.geom AS station_geom
+           (o.tags ->> 'public_transport' = 'stop_position' OR ps.station_id IS NOT NULL) IS TRUE AS on_track,
+           COALESCE(ps.stop_geom, o.geom) AS geom, st.geom AS station_geom
     FROM stations st
     JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+    LEFT JOIN platform_stops ps
+      ON ps.station_id = st.station_id AND ps.osm_type = o.osm_type AND ps.osm_id = o.osm_id
     CROSS JOIN LATERAL regexp_split_to_table(
         COALESCE(o.tags ->> 'railway:track_ref', o.tags ->> 'local_ref',
-                 CASE WHEN is_quay_code(o.tags ->> 'name') THEN o.tags ->> 'name' END,
-                 quay_of(o.tags ->> 'name'), o.tags ->> 'ref'), ';') AS r
+                 quay_code(o.tags ->> 'name'),
+                 quay_of(o.tags ->> 'name'),
+                 -- A bus or ferry stop's ref is its network's stop code ("5" at Agen - Gare
+                 -- SNCF), not a quay: their quays are local_ref, or in their names.
+                 CASE WHEN st.mode NOT IN ('bus', 'ferry') THEN o.tags ->> 'ref' END), ';') AS r
     -- "Voie 2", "Gleis 7": the track is the part after the word.
     CROSS JOIN LATERAL (SELECT regexp_replace(trim(r),
         '^(voie|gleis|gl\.?|track|platform|quai|binario|v[ií]a|spoor|tor|peron)\s*', '', 'i') AS ref) n
@@ -595,6 +675,17 @@ FROM stations s,
      jsonb_each_text(s.names || jsonb_build_object('latin', s.latin)) AS n(k, v),
      regexp_split_to_table(n.v, ';') AS part
 WHERE trim(part) <> '';
+
+-- The names of the other stops gathered into a station too: "agen gare sncf" finds the bus
+-- station whose stop that is.
+INSERT INTO station_names (station_id, mode, name, city_prefixed)
+SELECT DISTINCT st.station_id, st.mode, without_quay(o.tags ->> 'name'), false
+FROM stations st
+JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+WHERE o.is_primary AND o.tags ? 'name' AND NOT is_quay_code(o.tags ->> 'name')
+  AND NOT EXISTS (SELECT 1 FROM station_names n
+                  WHERE n.mode = st.mode AND n.station_id = st.station_id
+                    AND n.name = without_quay(o.tags ->> 'name'));
 
 -- Both ways round, as people type either: "villeneuve bordeneuve", "bordeneuve villeneuve".
 INSERT INTO station_names (station_id, mode, name, city_prefixed)

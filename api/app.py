@@ -163,6 +163,133 @@ def station(mode, key):
     return jsonify(station=station)
 
 
+def tidy_stops(stops):
+    """A route's stops ([lat, lng, name]) in an order that can be drawn.
+
+    Many routes are mapped badly: both directions in one relation (Toulouse - Albi - Rodez out
+    and back), or stops out of order (Varilhes before Toulouse). A stop listed again is
+    dropped; and where a chain from one end to the nearest stop each time is much shorter than
+    the given order, the chain is taken, run in the given direction. A curved line (Oslo's 4
+    via Majorstuen) keeps its order, being no shorter chained.
+    """
+    seen, kept = set(), []
+    for stop in stops:
+        key = (stop[2] or "").strip().lower() or (round(stop[0], 4), round(stop[1], 4))
+        if key not in seen:
+            seen.add(key)
+            kept.append(stop)
+    if len(kept) < 3:
+        return kept
+
+    def at(stop):
+        return {"lat": stop[0], "lng": stop[1]}
+
+    def length(chain):
+        return sum(metres(at(a), at(b)) for a, b in zip(chain, chain[1:]))
+
+    start, end = max(
+        ((i, j) for i in range(len(kept)) for j in range(i + 1, len(kept))),
+        key=lambda ij: metres(at(kept[ij[0]]), at(kept[ij[1]])),
+    )
+    chain, rest = [kept[start]], kept[:start] + kept[start + 1:]
+    while rest:
+        nearest = min(rest, key=lambda stop: metres(at(chain[-1]), at(stop)))
+        chain.append(nearest)
+        rest.remove(nearest)
+    if length(chain) >= length(kept) / 1.3:
+        return kept
+    # The direction the route was mapped in: from the end its first stop is nearer.
+    if metres(at(kept[0]), at(chain[-1])) < metres(at(kept[0]), at(chain[0])):
+        chain.reverse()
+    return chain
+
+
+@app.get("/station/<mode>/<key>/line")
+def station_line(mode, key):
+    """The line `ref` through a station: each of its route relations calling there, with its
+    stops in order ([lat, lng, name]), to draw where the line goes."""
+    rows = query(
+        """
+        WITH station AS (
+            SELECT mode, key FROM stations WHERE mode = %(mode)s AND station_key = %(key)s
+        ),
+        routes AS (
+            SELECT DISTINCT lr.relation_id
+            FROM station st
+            JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+            JOIN rel_members rm ON rm.osm_type = o.osm_type AND rm.osm_id = o.osm_id
+            JOIN line_routes lr ON lr.relation_id = rm.relation_id AND lr.mode = st.mode
+            WHERE lr.tags ->> 'ref' = %(ref)s
+        )
+        SELECT r.relation_id, r.tags ->> 'name' AS name, r.tags ->> 'colour' AS colour,
+               json_agg(json_build_array(ST_Y(s.geom), ST_X(s.geom), s.tags ->> 'name')
+                        ORDER BY rs.seq) AS stops
+        FROM routes
+        JOIN rels r USING (relation_id)
+        JOIN route_stops rs USING (relation_id)
+        JOIN stops s ON s.osm_type = rs.osm_type AND s.osm_id = rs.osm_id
+        GROUP BY r.relation_id, r.tags
+        """,
+        {"mode": mode, "key": key, "ref": request.args.get("ref")},
+    )
+    for row in rows:
+        row["stops"] = tidy_stops(row["stops"])
+    return jsonify(routes=rows)
+
+
+# The route relations of each mode, beyond those counted as its lines (line_routes).
+ROUTE_TYPES = {
+    "train": ["train"],
+    "metro": ["subway", "light_rail", "monorail"],
+    "tram": ["tram", "light_rail"],
+}
+
+
+@app.get("/station/<mode>/<key>/services")
+def station_services(mode, key):
+    """The routes calling at a station that are not among its lines: trains mapped one route
+    per train number ("TER 876206"), long-distance and night services."""
+    rows = query(
+        """
+        SELECT DISTINCT r.relation_id, r.tags ->> 'ref' AS ref, r.tags ->> 'name' AS name,
+               r.tags ->> 'network' AS network, r.tags ->> 'service' AS service,
+               r.tags ->> 'colour' AS colour
+        FROM stations st
+        JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+        JOIN rel_members rm ON rm.osm_type = o.osm_type AND rm.osm_id = o.osm_id
+        JOIN rels r ON r.relation_id = rm.relation_id
+        WHERE st.mode = %(mode)s AND st.station_key = %(key)s
+          AND r.tags ->> 'route' = ANY(%(routes)s)
+          AND NOT EXISTS (SELECT 1 FROM line_routes lr
+                          WHERE lr.relation_id = r.relation_id AND lr.mode = st.mode)
+        ORDER BY network, ref, name
+        """,
+        {"mode": mode, "key": key, "routes": ROUTE_TYPES.get(mode, [])},
+    )
+    return jsonify(services=rows)
+
+
+@app.get("/route/<int:relation_id>")
+def route(relation_id):
+    """One route relation's stops in order ([lat, lng, name]), tidied as for a line."""
+    rows = query(
+        """
+        SELECT r.relation_id, r.tags ->> 'name' AS name, r.tags ->> 'colour' AS colour,
+               json_agg(json_build_array(ST_Y(s.geom), ST_X(s.geom), s.tags ->> 'name')
+                        ORDER BY rs.seq) AS stops
+        FROM rels r
+        JOIN route_stops rs USING (relation_id)
+        JOIN stops s ON s.osm_type = rs.osm_type AND s.osm_id = rs.osm_id
+        WHERE r.relation_id = %(id)s
+        GROUP BY r.relation_id, r.tags
+        """,
+        {"id": relation_id},
+    )
+    for row in rows:
+        row["stops"] = tidy_stops(row["stops"])
+    return jsonify(routes=rows)
+
+
 @app.get("/reverse")
 def reverse():
     params = {
