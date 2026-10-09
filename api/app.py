@@ -18,7 +18,7 @@ COLUMNS = """
     s.station_id, s.station_key, s.mode, s.osm_type, s.osm_id, s.name, s.latin, s.names,
     s.city, s.region, s.country, ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
     s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight, s.needs_place,
-    s.line_name, s.ski_area, s.lift_end, s.settlement
+    s.line_name, s.ski_area, s.lift_end, s.settlement, s.city_override
 """
 
 
@@ -52,6 +52,17 @@ EXACT_BONUS = 2.0
 # The word similarity a fuzzy match (no name starting with the query) needs to be offered;
 # the index finds candidates from pg_trgm's 0.6.
 FUZZY_MIN = 0.7
+# What being used by Trainlog's users adds to importance, per ln(1 + users) (usage.py): a
+# station a hundred people use gains 6.9, about a terminus's routes; one ten use, 3.6.
+USAGE_WEIGHT = 1.5
+
+# Loaded by usage.py, kept apart from the build's schema; there, if empty, before the first.
+with pool.connection() as _conn:
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS public.station_usage (
+            mode text NOT NULL, station_key text NOT NULL, users integer NOT NULL,
+            PRIMARY KEY (mode, station_key))
+    """)
 
 
 @app.get("/search")
@@ -67,6 +78,7 @@ def search():
         "distance_penalty": DISTANCE_PENALTY,
         "exact_bonus": EXACT_BONUS,
         "fuzzy_min": FUZZY_MIN,
+        "usage_weight": USAGE_WEIGHT,
         **point_params(),
     }
     # Under three letters nearly every name shares a trigram with the query, so only
@@ -76,12 +88,13 @@ def search():
     mode_filter = "AND n.mode = %(mode)s" if mode else ""
     # Tiers, best first: whole words starting one of the station's names, city-prefixed or
     # not ("agen" in "Agen Gare", not in "Agence Commerciale": typing a city's name asks for
-    # its stations); the start of one of the station's names (the whole name counts
+    # its stations, the whole of it: "central" is not Central Bedfordshire's); the start of one of the station's names (the whole name counts
     # EXACT_BONUS more importance, not a tier of its own: "Oslo", a stop in Alsace, is no
     # better an answer than Oslo bussterminal); the start of a word in one ("montparnasse" in
     # "Gare Montparnasse"); the start of a city-prefixed name ("berlin" in "Berlin
     # Albrechtshof"); anything else matching. Within a tier the more important station comes
-    # first, but fuzzy matches go by score before that. Given a
+    # first (its weight, and how many Trainlog users use it), but fuzzy matches go by score
+    # before that. Given a
     # position (lat, lon), distance counts against importance: of the many stops named
     # "Poste", the one nearby, not the slightly busier one across the country.
     rows = query(
@@ -89,8 +102,10 @@ def search():
         WITH matched AS (
             SELECT n.station_id, n.name,
                    CASE
-                       WHEN n.folded = search_fold(%(q)s)
-                            OR n.folded LIKE search_fold(%(q)s) || ' %%' THEN 0
+                       WHEN (n.folded = search_fold(%(q)s)
+                             OR n.folded LIKE search_fold(%(q)s) || ' %%')
+                            AND (n.place IS NULL OR search_fold(%(q)s) = n.place
+                                 OR search_fold(%(q)s) LIKE n.place || ' %%') THEN 0
                        WHEN n.city_prefixed THEN
                            CASE WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 3 ELSE 4 END
                        WHEN n.folded LIKE search_fold(%(q)s) || '%%' THEN 1
@@ -113,6 +128,7 @@ def search():
                d.km AS distance_km
         FROM best b
         JOIN stations s USING (station_id)
+        LEFT JOIN station_usage u ON u.mode = s.mode AND u.station_key = s.station_key
         CROSS JOIN LATERAL (
             SELECT CASE WHEN %(lat)s::float8 IS NOT NULL THEN
                 ST_DistanceSphere(s.geom, ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326)) / 1000
@@ -124,6 +140,7 @@ def search():
         ORDER BY b.tier,
                  CASE WHEN b.tier = 4 THEN b.score END DESC NULLS FIRST,
                  s.weight + CASE WHEN b.exact THEN %(exact_bonus)s ELSE 0 END
+                     + %(usage_weight)s * ln(1 + COALESCE(u.users, 0))
                      - %(distance_penalty)s * ln(1 + COALESCE(d.km, 0)) DESC,
                  s.name
         LIMIT %(limit)s

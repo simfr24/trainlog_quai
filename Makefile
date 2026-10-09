@@ -4,6 +4,7 @@
 #   make all REGIONS=europe/france/ile-de-france   the same for one small region
 #   make build                                     rebuild the stations from the last import
 #   make serve                                     (re)start the API
+#   make usage USAGE=usage.csv                     load Trainlog's station usage (usage.py)
 #
 # REGIONS are Geofabrik extract paths; the default covers the world. Downloads are only
 # refreshed when Geofabrik has a newer file, and filtering runs in parallel with -j.
@@ -63,4 +64,8 @@ build:
 serve:
 	docker compose up -d --build api
 
-.PHONY: all download filtered.osm.pbf import build serve
+USAGE ?= usage.csv
+usage:
+	docker compose run --rm --build import python3 /data/usage.py /data/$(USAGE)
+
+.PHONY: all download filtered.osm.pbf import build serve usage

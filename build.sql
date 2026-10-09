@@ -345,6 +345,7 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        NULL::text AS country,
        NULL::text AS region,
        NULL::jsonb AS city,
+       NULL::boolean AS city_override,
        NULL::jsonb AS lines,
        NULL::jsonb AS tracks,
        NULL::text AS station_key,
@@ -483,6 +484,8 @@ CREATE UNLOGGED TABLE station_places AS
                     'name', b.tags ->> 'name', 'name:en', b.tags ->> 'name:en'))
                     ORDER BY b.admin_level DESC) FILTER (WHERE b.admin_level BETWEEN 6 AND 8))[1]
            ) AS city,
+           -- The city is one places.csv names (London, not Camden): a name's prefix then.
+           bool_or(co.relation_id IS NOT NULL) AS city_override,
            array_agg(DISTINCT b.relation_id)
                FILTER (WHERE b.admin_level BETWEEN 4 AND 8 OR co.relation_id IS NOT NULL)
                AS boundary_ids
@@ -494,6 +497,7 @@ UPDATE stations s SET
     country = COALESCE(p.country, p.region_country),
     region  = p.region,
     city    = p.city,
+    city_override = p.city_override,
     boundary_ids = p.boundary_ids
 FROM station_places p
 WHERE s.station_id = p.station_id;
@@ -503,18 +507,43 @@ DROP TABLE station_places;
 -- @step settlements
 -- The town, village or hamlet a station is at (Åndalsnes, in Rauma kommune), which people
 -- know it by better than its municipality: searched on, shown, and put before a name that
--- needs a place. The place nearest relative to its kind's reach (a city 8km, a town 4km, a
--- village 2km, a hamlet 800m), so that a station by a village is in it however large its
--- municipality. Not suburbs or districts: Paris's stations are in Paris, not Bercy.
+-- needs a place. Of the places within their kind's reach (a city 8km, a town 4km, a village
+-- 2km, a hamlet 800m), so that a station by a village is in it however large its
+-- municipality: first those in the station's own municipality, as Gare de Dax is in Dax
+-- though Saint-Paul-lès-Dax, over the commune's edge, is nearer; then a city, whose hamlets
+-- are its neighbourhoods (Fyllingsdalen terminal is in Bergen, not Sælen); then the nearest
+-- relative to its reach. Not suburbs or districts:
+-- Paris's stations are in Paris, not Bercy.
+-- A municipality is the lowest boundary of levels 6 to 8 (Camden, in London: Euston is in
+-- Camden Town, which helps tell it apart, though its prefix is London's, city_override).
+-- Every one each place is in, found once.
+CREATE UNLOGGED TABLE muni_levels AS
+SELECT relation_id, admin_level FROM boundaries WHERE admin_level BETWEEN 6 AND 8;
+CREATE INDEX ON muni_levels (relation_id);
+CREATE UNLOGGED TABLE place_munis AS
+SELECT DISTINCT pl.node_id, b.relation_id
+FROM places pl
+JOIN boundary_parts b ON ST_Contains(b.geom, pl.geom)
+JOIN muni_levels ml ON ml.relation_id = b.relation_id;
+CREATE INDEX ON place_munis (node_id, relation_id);
+ANALYZE muni_levels;
+ANALYZE place_munis;
 CREATE UNLOGGED TABLE station_settlements AS
 SELECT s.station_id, p.settlement
 FROM stations s
+LEFT JOIN LATERAL (
+    SELECT ml.relation_id
+    FROM unnest(s.boundary_ids) AS bid
+    JOIN muni_levels ml ON ml.relation_id = bid
+    ORDER BY ml.admin_level DESC
+    LIMIT 1
+) muni ON true
 CROSS JOIN LATERAL (
     SELECT jsonb_strip_nulls(jsonb_build_object(
                'name', near.tags ->> 'name', 'name:en', near.tags ->> 'name:en', 'place', near.place))
                AS settlement
     FROM (
-        SELECT pl.place, pl.tags,
+        SELECT pl.node_id, pl.place, pl.tags,
                ST_DistanceSphere(pl.geom, s.geom) / CASE pl.place
                    WHEN 'city' THEN 8000 WHEN 'town' THEN 4000 WHEN 'village' THEN 2000 ELSE 800
                END AS reach
@@ -523,14 +552,17 @@ CROSS JOIN LATERAL (
         ORDER BY pl.geom <-> s.geom
         LIMIT 16
     ) near
+    LEFT JOIN place_munis pm ON pm.node_id = near.node_id AND pm.relation_id = muni.relation_id
     WHERE near.reach <= 1
-    ORDER BY near.reach
+    ORDER BY pm.node_id IS NOT NULL DESC,
+             near.place = 'city' DESC,
+             near.reach
     LIMIT 1
 ) p;
 UPDATE stations s SET settlement = x.settlement
 FROM station_settlements x
 WHERE s.station_id = x.station_id;
-DROP TABLE station_settlements;
+DROP TABLE station_settlements, place_munis, muni_levels;
 
 
 -- @step station lines
@@ -668,6 +700,22 @@ FROM (
     WHERE st.mode IN ('aerialway', 'funicular')
     GROUP BY st.station_id
     HAVING count(DISTINCT w.name) = 1
+) l
+WHERE s.station_id = l.station_id;
+
+-- Where several pass, the one named as the station: Val Louron's Ardounes and Tuco run side by
+-- side, 6m apart, each station named as its own lift.
+UPDATE stations s SET line_name = l.name
+FROM (
+    SELECT DISTINCT ON (st.station_id) st.station_id, w.name
+    FROM stations st
+    JOIN line_ways w
+      ON w.kind = st.mode
+     AND w.geom && ST_Expand(st.geom, 0.002)
+     AND ST_DWithin(w.geom::geography, st.geom::geography, 60)
+     AND search_fold(w.name) = search_fold(st.name)
+    WHERE st.mode IN ('aerialway', 'funicular') AND st.line_name IS NULL
+    ORDER BY st.station_id, w.geom <-> st.geom
 ) l
 WHERE s.station_id = l.station_id;
 
@@ -851,12 +899,15 @@ WHERE s.station_id = unique_name.station_id AND s.needs_place
 -- @step search names
 -- Every spelling to search on, one partition per mode so that a search reads its mode's
 -- names only: bus stops are nine stations in ten. Each name is also prefixed with its city
--- ("Paris Gare de Lyon"), marked as such since it matches every station of the city.
+-- ("Paris Gare de Lyon"), marked as such since it matches every station of the city, and with
+-- the place it starts with (folded), which a search must name whole to list the place's
+-- stations: "bergen" lists Bergen's, "central" not Central Bedfordshire's.
 CREATE TABLE station_names (
     station_id    integer NOT NULL,
     mode          text NOT NULL,
     name          text NOT NULL,
     city_prefixed boolean NOT NULL,
+    place         text,
     folded        text GENERATED ALWAYS AS (search_fold(name)) STORED
 ) PARTITION BY LIST (mode);
 
@@ -899,13 +950,14 @@ WHERE o.is_primary AND o.tags ? 'name' AND NOT is_quay_code(o.tags ->> 'name')
                     AND n.name = without_quay(o.tags ->> 'name'));
 
 -- Both ways round, as people type either: "villeneuve bordeneuve", "bordeneuve villeneuve".
-INSERT INTO station_names (station_id, mode, name, city_prefixed)
-SELECT DISTINCT n.station_id, n.mode, v.name, true
+INSERT INTO station_names (station_id, mode, name, city_prefixed, place)
+SELECT DISTINCT n.station_id, n.mode, v.name, true, v.place
 FROM station_names n
 JOIN stations s USING (station_id)
 CROSS JOIN LATERAL (VALUES (s.city ->> 'name'), (s.city ->> 'name:en'),
                            (s.settlement ->> 'name'), (s.settlement ->> 'name:en')) AS c(city)
-CROSS JOIN LATERAL (VALUES (c.city || ' ' || n.name), (n.name || ' ' || c.city)) AS v(name)
+CROSS JOIN LATERAL (VALUES (c.city || ' ' || n.name, search_fold(c.city)),
+                           (n.name || ' ' || c.city, NULL)) AS v(name, place)
 WHERE c.city IS NOT NULL AND n.folded NOT LIKE '%' || search_fold(c.city) || '%';
 
 CREATE INDEX ON station_names USING gin (folded gin_trgm_ops);

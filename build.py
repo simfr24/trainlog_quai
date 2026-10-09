@@ -21,6 +21,7 @@ import time
 import psycopg
 
 from latin import latin_name
+from usage import follow_redirects
 
 BUILD_SQL = "/data/build.sql"
 INPUT = "/data/filtered.osm.pbf"
@@ -275,6 +276,10 @@ def main():
         with conn.transaction():
             conn.execute("DROP SCHEMA IF EXISTS live CASCADE")
             conn.execute("ALTER SCHEMA build RENAME TO live")
+
+        # Trainlog's usage counts (usage.py) follow the stations whose keys this build moved.
+        print("following usage to moved keys...", flush=True)
+        follow_redirects(conn)
 
         print("prewarming...", flush=True)
         prewarm(conn)
