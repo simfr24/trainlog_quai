@@ -32,6 +32,15 @@ CREATE OR REPLACE FUNCTION public.without_quay(text) RETURNS text AS $$
         '\s+\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$', '')
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
+-- A name without the line or mode it ends with: "Charles de Gaulle — Étoile (Métro 6)",
+-- "(RER A)", "(Ligne 1)", "(Tram T2)", "(U-Bahn)". One station mapped once per line, which
+-- the merge (merge nearby duplicates) makes one again.
+CREATE OR REPLACE FUNCTION public.without_line(text) RETURNS text AS $$
+    SELECT regexp_replace($1,
+        '\s*[(\[](?:m[ée]tro|rer|tram(?:way)?|ligne|line|linie|lijn|linea|línea|u-?bahn|s-?bahn|'
+        'stadtbahn|subway|bus|trolleybus)\y[^)\]]*[)\]]\s*$', '', 'i')
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 CREATE OR REPLACE FUNCTION public.quay_of(text) RETURNS text AS $$
     SELECT substring($1 FROM
         '\s\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$')
@@ -206,8 +215,9 @@ CREATE INDEX ON station_objects (osm_type, osm_id);
 -- @step merge nearby duplicates
 -- One station is often several same-named groups close together: a bus stop per side of
 -- the street, a quay each ("(E)", "(F)"), one with its town and one without ("Royan - Gare",
--- "Gare"), or two station nodes with no shared stop_area. Clustered within 400m, on an
--- equirectangular projection so that is metres at any latitude.
+-- "Gare"), one per line ("Charles de Gaulle — Étoile (Métro 1)", "(Métro 6)"), or two station
+-- nodes with no shared stop_area. Clustered within 400m, on an equirectangular projection so
+-- that is metres at any latitude.
 ALTER TABLE station_objects ADD COLUMN source_key text;
 UPDATE station_objects SET source_key = key;
 
@@ -216,8 +226,9 @@ WITH named AS (
            o.mode, o.key,
            -- Without a leading place either ("Royan - Gare (Quai C)" beside "Gare"): only
            -- stops of one mode within 400m are compared.
-           search_fold(regexp_replace(without_quay(COALESCE(o.tags ->> 'name', area.tags ->> 'name')),
-                                      '^.+?\s+-\s+', '')) AS name,
+           search_fold(regexp_replace(
+               without_line(without_quay(COALESCE(o.tags ->> 'name', area.tags ->> 'name'))),
+               '^.+?\s+-\s+', '')) AS name,
            o.geom
     FROM station_objects o
     LEFT JOIN rels area
@@ -304,15 +315,17 @@ WITH rep AS (
     SELECT DISTINCT ON (mode, key) mode, key, osm_type, osm_id, tags, geom
     FROM station_objects
     WHERE is_primary
-    -- A bus station over the stops it gathers.
+    -- A bus station over the stops it gathers; one named as the station, not one of its lines.
     ORDER BY mode, key, (tags ->> 'amenity' = 'bus_station') IS TRUE DESC, (tags ? 'name') DESC,
+             (tags ->> 'name' IS DISTINCT FROM without_line(tags ->> 'name')),
              osm_type, osm_id
 ),
 grouped AS (
     SELECT mode, key,
            jsonb_agg(jsonb_build_array(osm_type, osm_id)) AS objects,
            max(tags ->> 'wikidata') AS wikidata,
-           max(tags ->> 'uic_ref') AS uic_ref
+           max(tags ->> 'uic_ref') AS uic_ref,
+           count(DISTINCT source_key) > 1 AS merged
     FROM station_objects
     GROUP BY mode, key
 ),
@@ -329,7 +342,9 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        r.key,
        r.osm_type,
        r.osm_id,
-       without_quay(COALESCE(r.tags ->> 'name', area.tags ->> 'name')) AS name,
+       -- A station merged from several, not named after one of their lines.
+       CASE WHEN g.merged THEN without_line(without_quay(COALESCE(r.tags ->> 'name', area.tags ->> 'name')))
+            ELSE without_quay(COALESCE(r.tags ->> 'name', area.tags ->> 'name')) END AS name,
        COALESCE((
            SELECT jsonb_object_agg(k, without_quay(v))
            FROM jsonb_each_text(COALESCE(area.tags, '{}') || r.tags) AS t(k, v)
