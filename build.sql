@@ -152,10 +152,16 @@ CREATE UNLOGGED TABLE stop_modes AS
 SELECT s.osm_type, s.osm_id, m.mode
 FROM stops s
 CROSS JOIN LATERAL (VALUES
-    -- train=yes on a metro station (Paris's Gare d'Austerlitz, Bérault) is mapper noise: the
-    -- trains stop at the station beside it. Tram-trains (station=light_rail) keep it.
+    -- A railway station is a train station unless its station= says another mode, or a dead
+    -- one: station=rail (Lausanne), preserved_railway (Ongar) and the like are trains, and
+    -- "train;subway" is one too. train=yes on a metro station (Paris's Gare d'Austerlitz,
+    -- Bérault) is mapper noise: the trains stop at the station beside it. Tram-trains
+    -- (station=light_rail) keep it.
     ('train',     s.tags ->> 'railway' IN ('station', 'halt')
-                  AND COALESCE(s.tags ->> 'station', 'train') = 'train'
+                  AND (s.tags ->> 'station' ~ '(^|;)\s*train\s*($|;)'
+                       OR NOT string_to_array(regexp_replace(COALESCE(s.tags ->> 'station', ''), '\s', '', 'g'), ';')
+                          && ARRAY['subway', 'light_rail', 'monorail', 'funicular', 'miniature', 'tram',
+                                   'disused', 'abandoned', 'construction', 'proposed'])
                   OR s.tags ->> 'train' = 'yes'
                   AND COALESCE(s.tags ->> 'station', '') NOT IN ('subway', 'monorail')),
     ('metro',     s.tags ->> 'station' IN ('subway', 'light_rail', 'monorail')
@@ -524,10 +530,10 @@ DROP TABLE station_places;
 -- know it by better than its municipality: searched on, shown, and put before a name that
 -- needs a place. Of the places within their kind's reach (a city 8km, a town 4km, a village
 -- 2km, a hamlet 800m), so that a station by a village is in it however large its
--- municipality: first those in the station's own municipality, as Gare de Dax is in Dax
--- though Saint-Paul-lès-Dax, over the commune's edge, is nearer; then a city, whose hamlets
--- are its neighbourhoods (Fyllingsdalen terminal is in Bergen, not Sælen); then the nearest
--- relative to its reach. Not suburbs or districts:
+-- municipality: those in the station's own municipality only, as Gare de Dax is in Dax though
+-- Saint-Paul-lès-Dax, over the commune's edge, is nearer (none in reach: it has none, and
+-- goes by its municipality); a city first, whose hamlets are its neighbourhoods (Fyllingsdalen
+-- terminal is in Bergen, not Sælen); then the nearest relative to its reach. Not suburbs or districts:
 -- Paris's stations are in Paris, not Bercy.
 -- A municipality is the lowest boundary of levels 6 to 8 (Camden, in London: Euston is in
 -- Camden Town, which helps tell it apart, though its prefix is London's, city_override).
@@ -568,9 +574,10 @@ CROSS JOIN LATERAL (
         LIMIT 16
     ) near
     LEFT JOIN place_munis pm ON pm.node_id = near.node_id AND pm.relation_id = muni.relation_id
-    WHERE near.reach <= 1
-    ORDER BY pm.node_id IS NOT NULL DESC,
-             near.place = 'city' DESC,
+    -- Only in its own municipality, where it has one: Köln-Chorweiler, 10km from Köln's node,
+    -- is in Köln (its municipality, then) and not in Leverkusen, nearer across the border.
+    WHERE near.reach <= 1 AND (muni.relation_id IS NULL OR pm.node_id IS NOT NULL)
+    ORDER BY near.place = 'city' DESC,
              near.reach
     LIMIT 1
 ) p;

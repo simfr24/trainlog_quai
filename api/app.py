@@ -398,8 +398,12 @@ def nearest():
     rows = query(
         f"""
         SELECT p.i, {COLUMNS},
-               ST_Distance(s.geom::geography,
-                           ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography) AS distance_m
+               -- To the nearest of its point and its objects, as /reverse.
+               LEAST(ST_Distance(s.geom::geography,
+                                 ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography),
+                     (SELECT min(ST_Distance(o.geom::geography,
+                                             ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography))
+                      FROM station_objects o WHERE o.mode = s.mode AND o.key = s.key)) AS distance_m
         FROM unnest(%(lats)s::float8[], %(lngs)s::float8[]) WITH ORDINALITY AS p(lat, lng, i)
         CROSS JOIN LATERAL (
             SELECT * FROM stations s
@@ -437,10 +441,18 @@ def reverse():
     }
     if params["lat"] is None or params["lon"] is None:
         return jsonify(error="lat and lon are required"), 400
+    # The distance to a station is to the nearest of its point and its objects (platforms,
+    # stop positions): a stop on one of a big station's platforms is at it, though 220m from
+    # its node (Paris Nord), and nearer it than a station whose node is closer.
     rows = query(
         f"""
-        SELECT {COLUMNS}, ST_Distance(s.geom::geography, p::geography) AS distance_m
+        SELECT {COLUMNS}, d.m AS distance_m
         FROM stations s, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326) AS p
+        CROSS JOIN LATERAL (
+            SELECT LEAST(ST_Distance(s.geom::geography, p::geography),
+                         (SELECT min(ST_Distance(o.geom::geography, p::geography))
+                          FROM station_objects o WHERE o.mode = s.mode AND o.key = s.key)) AS m
+        ) d
         WHERE (%(mode)s::text IS NULL OR s.mode = %(mode)s)
           AND ST_DWithin(s.geom::geography, p::geography, %(radius)s)
         ORDER BY distance_m
