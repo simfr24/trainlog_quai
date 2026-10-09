@@ -444,9 +444,23 @@ def reverse():
     # The distance to a station is to the nearest of its point and its objects (platforms,
     # stop positions): a stop on one of a big station's platforms is at it, though 220m from
     # its node (Paris Nord), and nearer it than a station whose node is closer.
+    # With quays=1, each station's objects that carry a stop-point id (ref:IFOPT: Germany's
+    # DHIDs, de:05315:16101:7:72; Switzerland's SLOIDs), [{ids, ref, lat, lng, on_track}]:
+    # a timetable naming its stops by those ids (Transitous's DELFI) then says the very
+    # platform, whatever its own platform numbers ("75" for Chorweiler's track 2).
+    quays = """,
+        (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'ids', string_to_array(COALESCE(o.tags ->> 'ref:IFOPT', o.tags ->> 'ref:ifopt'), ';'),
+                    'ref', COALESCE(o.tags ->> 'local_ref', o.tags ->> 'ref'),
+                    'lat', ST_Y(o.geom), 'lng', ST_X(o.geom),
+                    'on_track', o.tags ->> 'public_transport' = 'stop_position')), '[]')
+         FROM station_objects o
+         WHERE o.mode = s.mode AND o.key = s.key
+           AND (o.tags ? 'ref:IFOPT' OR o.tags ? 'ref:ifopt')) AS quays
+    """ if request.args.get("quays") else ""
     rows = query(
         f"""
-        SELECT {COLUMNS}, d.m AS distance_m
+        SELECT {COLUMNS}, d.m AS distance_m{quays}
         FROM stations s, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326) AS p
         CROSS JOIN LATERAL (
             SELECT LEAST(ST_Distance(s.geom::geography, p::geography),
