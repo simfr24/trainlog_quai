@@ -847,6 +847,13 @@ ANALYZE boundary_names;
 
 -- Every run of up to five consecutive words of the given names: what a boundary name, itself
 -- up to a few words, is compared to, as an exact match.
+-- A name folded as search_fold, but with an apostrophe a word break: "Cœur d'Orly" is
+-- "coeur d orly", in which Orly's name is a word. search_fold drops them, for "oconnell" to
+-- find O'Connell, which would hide the place in every French elision ("coeur dorly").
+CREATE OR REPLACE FUNCTION public.elision_fold(text) RETURNS text AS $$
+    SELECT trim(regexp_replace(public.fold($1), '[^[:alnum:]]+', ' ', 'g'))
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
 CREATE OR REPLACE FUNCTION public.word_runs(VARIADIC names text[]) RETURNS SETOF text AS $$
     SELECT array_to_string(w[i:j], ' ')
     FROM unnest(names) AS t(name),
@@ -862,7 +869,7 @@ CREATE UNLOGGED TABLE station_runs AS
 SELECT st.station_id, bid, run
 FROM stations st,
      unnest(st.boundary_ids) AS bid,
-     word_runs(search_fold(st.name), search_fold(st.latin)) AS run
+     word_runs(search_fold(st.name), search_fold(st.latin), elision_fold(st.name)) AS run
 WHERE st.city IS NOT NULL OR st.settlement IS NOT NULL;
 ANALYZE station_runs;
 
@@ -885,7 +892,7 @@ FROM stations s
 WHERE s.needs_place
   AND EXISTS (
       SELECT 1
-      FROM places pl, word_runs(search_fold(s.name), search_fold(s.latin)) AS run
+      FROM places pl, word_runs(search_fold(s.name), search_fold(s.latin), elision_fold(s.name)) AS run
       WHERE pl.geom && ST_Expand(s.geom, 0.06)
         AND ST_DWithin(pl.geom::geography, s.geom::geography, 3000)
         AND run IN (search_fold(pl.tags ->> 'name'), search_fold(pl.tags ->> 'name:en')));
