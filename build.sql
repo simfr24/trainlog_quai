@@ -351,6 +351,10 @@ SELECT row_number() OVER (ORDER BY r.mode, r.key)::int AS station_id,
        NULL::float8 AS weight,
        NULL::text AS latin,
        NULL::bigint[] AS boundary_ids,
+       NULL::text AS line_name,
+       NULL::text AS ski_area,
+       NULL::text AS lift_end,
+       NULL::jsonb AS settlement,
        NULL::boolean AS needs_place
 FROM rep r
 JOIN grouped g USING (mode, key)
@@ -367,10 +371,44 @@ CREATE INDEX ON stations (mode);
 CREATE INDEX ON stations (mode, key);
 
 
+-- @step lift ends
+-- A named lift with no named station mapped at an end (Tråstølheisen): a station there, known by
+-- the lift's name and which end it is (lift_end: lower at its first node, upper at its last,
+-- lifts being mapped uphill); Trainlog writes the end in the user's language. Not where
+-- another way of the same lift goes on (a joint), nor for funiculars, whose tracks come in
+-- pieces.
+INSERT INTO stations (station_id, mode, key, osm_type, osm_id, name, names, geom, objects,
+                      station_key, line_name, lift_end)
+SELECT (SELECT max(station_id) FROM stations) + row_number() OVER (ORDER BY e.way_id, e.lift_end),
+       'aerialway', 'L' || e.way_id || e.lift_end, 'W', e.way_id, e.name,
+       jsonb_build_object('name', e.name), e.geom,
+       jsonb_build_array(jsonb_build_array('W', e.way_id)),
+       'W' || e.way_id || ':' || e.lift_end, e.name, e.lift_end
+FROM (
+    SELECT w.way_id, w.name, v.lift_end, v.geom
+    FROM line_ways w
+    CROSS JOIN LATERAL (VALUES ('lower', ST_StartPoint(w.geom)),
+                               ('upper', ST_EndPoint(w.geom))) AS v(lift_end, geom)
+    WHERE w.kind = 'aerialway'
+) e
+WHERE NOT EXISTS (
+        -- A station mapped without a name (Romsdalsgondolen's) is none: it cannot be one
+        -- of quai's, which are named.
+        SELECT 1 FROM station_objects o
+        WHERE o.mode = 'aerialway' AND o.is_primary AND o.tags ? 'name'
+          AND o.geom && ST_Expand(e.geom, 0.002)
+          AND ST_DWithin(o.geom::geography, e.geom::geography, 60))
+  AND NOT EXISTS (
+        SELECT 1 FROM line_ways other
+        WHERE other.kind = 'aerialway' AND other.way_id <> e.way_id AND other.name = e.name
+          AND other.geom && ST_Expand(e.geom, 0.0005)
+          AND ST_DWithin(other.geom::geography, e.geom::geography, 5));
+
+
 -- @step station keys
 -- The key Trainlog stores, unique within the mode: the wikidata item, else the UIC code,
 -- else the representative object. The first two survive OSM remapping a station's objects;
--- key_redirects (see build.py) covers the rest.
+-- key_redirects (see build.py) covers the rest. A lift's end has its own already.
 UPDATE stations s SET station_key = c.key
 FROM (
     SELECT DISTINCT ON (station_id) station_id, key
@@ -383,7 +421,7 @@ FROM (
             (2, 'UIC' || NULLIF(trim(s.uic_ref), '')),
             (3, s.osm_type || s.osm_id)
         ) AS k(priority, key)
-        WHERE k.key IS NOT NULL
+        WHERE k.key IS NOT NULL AND s.station_key IS NULL
     ) candidates
     WHERE holders = 1
     ORDER BY station_id, priority
@@ -460,6 +498,39 @@ UPDATE stations s SET
 FROM station_places p
 WHERE s.station_id = p.station_id;
 DROP TABLE station_places;
+
+
+-- @step settlements
+-- The town, village or hamlet a station is at (Åndalsnes, in Rauma kommune), which people
+-- know it by better than its municipality: searched on, shown, and put before a name that
+-- needs a place. The place nearest relative to its kind's reach (a city 8km, a town 4km, a
+-- village 2km, a hamlet 800m), so that a station by a village is in it however large its
+-- municipality. Not suburbs or districts: Paris's stations are in Paris, not Bercy.
+CREATE UNLOGGED TABLE station_settlements AS
+SELECT s.station_id, p.settlement
+FROM stations s
+CROSS JOIN LATERAL (
+    SELECT jsonb_strip_nulls(jsonb_build_object(
+               'name', near.tags ->> 'name', 'name:en', near.tags ->> 'name:en', 'place', near.place))
+               AS settlement
+    FROM (
+        SELECT pl.place, pl.tags,
+               ST_DistanceSphere(pl.geom, s.geom) / CASE pl.place
+                   WHEN 'city' THEN 8000 WHEN 'town' THEN 4000 WHEN 'village' THEN 2000 ELSE 800
+               END AS reach
+        FROM places pl
+        WHERE pl.geom && ST_Expand(s.geom, 0.15)
+        ORDER BY pl.geom <-> s.geom
+        LIMIT 16
+    ) near
+    WHERE near.reach <= 1
+    ORDER BY near.reach
+    LIMIT 1
+) p;
+UPDATE stations s SET settlement = x.settlement
+FROM station_settlements x
+WHERE s.station_id = x.station_id;
+DROP TABLE station_settlements;
 
 
 -- @step station lines
@@ -582,13 +653,105 @@ FROM (
 WHERE s.station_id = t.station_id;
 
 
+-- @step lift lines
+-- The line an aerialway or funicular station is on, by the name people know it under
+-- (Fløibanen, Ulriksbanen): the named line passing within 60m of it, when only one does. A
+-- ski area's hub where several lifts meet gets none.
+UPDATE stations s SET line_name = l.name
+FROM (
+    SELECT st.station_id, min(w.name) AS name
+    FROM stations st
+    JOIN line_ways w
+      ON w.kind = st.mode
+     AND w.geom && ST_Expand(st.geom, 0.002)
+     AND ST_DWithin(w.geom::geography, st.geom::geography, 60)
+    WHERE st.mode IN ('aerialway', 'funicular')
+    GROUP BY st.station_id
+    HAVING count(DISTINCT w.name) = 1
+) l
+WHERE s.station_id = l.station_id;
+
+-- A lift's two stations named alike (Val Thorens's "Boismint" at both ends): told apart as its
+-- lower and upper ends, by which end of the line each is nearer, as for the ends no station
+-- is mapped at (lift_end).
+UPDATE stations s SET lift_end = CASE
+        WHEN ST_Distance(s.geom, ST_StartPoint(w.geom)) <= ST_Distance(s.geom, ST_EndPoint(w.geom))
+        THEN 'lower' ELSE 'upper' END
+FROM line_ways w
+WHERE s.mode = 'aerialway' AND s.lift_end IS NULL
+  AND w.kind = 'aerialway' AND w.name = s.line_name
+  AND w.geom && ST_Expand(s.geom, 0.002)
+  AND ST_DWithin(w.geom::geography, s.geom::geography, 60)
+  AND EXISTS (SELECT 1 FROM stations twin
+              WHERE twin.mode = s.mode AND twin.station_id <> s.station_id
+                AND twin.line_name = s.line_name
+                AND search_fold(twin.name) = search_fold(s.name)
+                AND ST_DWithin(twin.geom::geography, s.geom::geography, 10000));
+
+-- A station named as its lift ("Voss Gondol"), on a lift whose other end has no station
+-- mapped and so gets one (lift ends): marked as its end too, so that the two read alike.
+UPDATE stations s SET lift_end = CASE
+        WHEN ST_Distance(s.geom, ST_StartPoint(w.geom)) <= ST_Distance(s.geom, ST_EndPoint(w.geom))
+        THEN 'lower' ELSE 'upper' END
+FROM line_ways w
+WHERE s.mode = 'aerialway' AND s.lift_end IS NULL
+  AND w.kind = 'aerialway' AND w.name = s.line_name
+  AND search_fold(s.name) = search_fold(s.line_name)
+  AND w.geom && ST_Expand(s.geom, 0.002)
+  AND ST_DWithin(w.geom::geography, s.geom::geography, 60)
+  AND EXISTS (SELECT 1 FROM stations added
+              WHERE added.mode = 'aerialway' AND added.osm_type = 'W'
+                AND added.osm_id = w.way_id AND added.lift_end IS NOT NULL);
+
+-- A lift's or funicular's station on its line: OSM puts it in its building, off the cable
+-- (Voss Gondol, 30m away), where a router cannot find the lift. Moved to the nearest point
+-- of its line.
+UPDATE stations s SET geom = ST_ClosestPoint(w.geom, s.geom)
+FROM line_ways w
+WHERE s.mode IN ('aerialway', 'funicular')
+  AND w.kind = s.mode AND w.name = s.line_name
+  AND w.geom && ST_Expand(s.geom, 0.002)
+  AND ST_DWithin(w.geom::geography, s.geom::geography, 60);
+
+
+-- The ski area an aerialway or funicular station is in (Val Thorens), which its lifts go by
+-- more than any one of them. One per lift, so that both its ends say the same: the smallest
+-- named area containing the middle of the station's line. A station on no known line: the
+-- smallest area within 100m of it.
+UPDATE stations s SET ski_area = a.name
+FROM (
+    SELECT DISTINCT ON (st.station_id) st.station_id, ski.name
+    FROM stations st
+    JOIN line_ways w
+      ON w.kind = st.mode AND w.name = st.line_name
+     AND w.geom && ST_Expand(st.geom, 0.002)
+     AND ST_DWithin(w.geom::geography, st.geom::geography, 60)
+    JOIN ski_areas ski ON ST_Contains(ski.geom, ST_LineInterpolatePoint(w.geom, 0.5))
+    WHERE st.mode IN ('aerialway', 'funicular')
+    ORDER BY st.station_id, ST_Area(ski.geom)
+) a
+WHERE s.station_id = a.station_id;
+
+UPDATE stations s SET ski_area = a.name
+FROM (
+    SELECT DISTINCT ON (st.station_id) st.station_id, ski.name
+    FROM stations st
+    JOIN ski_areas ski
+      ON ski.geom && ST_Expand(st.geom, 0.003)
+     AND ST_DWithin(ski.geom::geography, st.geom::geography, 100)
+    WHERE st.mode IN ('aerialway', 'funicular') AND st.line_name IS NULL
+    ORDER BY st.station_id, ST_Area(ski.geom)
+) a
+WHERE s.station_id = a.station_id;
+
+
 -- @step latin names
 -- @python latin_names
 
 
 -- @step place names
--- Whether a station's name needs its city to make sense: "Gare" in Royan is "Royan - Gare",
--- "Gare de Lyon" in Paris "Paris - Gare de Lyon"; not when the name (or its Latin form)
+-- Whether a station's name needs its city to make sense: "Gare" in Royan is "Royan - Gare";
+-- not when the name is the only one of its kind (below), nor when the name (or its Latin form)
 -- already says where it is, in any language and at any level from municipality to region:
 -- Brussels-Luxembourg sits in Ixelles, but says Brussels. A boundary's names count whole,
 -- split where bilingual ("Ixelles - Elsene"), and without generic words, so that "Région de
@@ -637,10 +800,10 @@ SELECT st.station_id, bid, run
 FROM stations st,
      unnest(st.boundary_ids) AS bid,
      word_runs(search_fold(st.name), search_fold(st.latin)) AS run
-WHERE st.city IS NOT NULL;
+WHERE st.city IS NOT NULL OR st.settlement IS NOT NULL;
 ANALYZE station_runs;
 
-UPDATE stations SET needs_place = city IS NOT NULL;
+UPDATE stations SET needs_place = city IS NOT NULL OR settlement IS NOT NULL;
 UPDATE stations s SET needs_place = false
 FROM (
     SELECT DISTINCT sr.station_id
@@ -649,6 +812,40 @@ FROM (
 ) said
 WHERE s.station_id = said.station_id;
 DROP TABLE station_runs;
+
+-- Nor where the name is that of a town, village or hamlet near it: "Åndalsnes" at Åndalsnes,
+-- a stop named after its hamlet even where another village is nearer and so its settlement.
+-- Found into a table first, on all cores.
+CREATE UNLOGGED TABLE named_after_places AS
+SELECT s.station_id
+FROM stations s
+WHERE s.needs_place
+  AND EXISTS (
+      SELECT 1
+      FROM places pl, word_runs(search_fold(s.name), search_fold(s.latin)) AS run
+      WHERE pl.geom && ST_Expand(s.geom, 0.06)
+        AND ST_DWithin(pl.geom::geography, s.geom::geography, 3000)
+        AND run IN (search_fold(pl.tags ->> 'name'), search_fold(pl.tags ->> 'name:en')));
+UPDATE stations s SET needs_place = false
+FROM named_after_places n
+WHERE s.station_id = n.station_id;
+DROP TABLE named_after_places;
+
+-- And for a train station, ferry terminal or funicular, only where the name alone is
+-- ambiguous: another of the mode in the country has it. A name of its own needs no place,
+-- however large the municipality it falls in: Myrdal, not "Aurland - Myrdal"; Frekhaug kai,
+-- not "Alver - Frekhaug kai". Bus, tram and metro stops are local, their names said within a
+-- town ("Mairie", "Château"), and so are aerialway stations ("Bergstation"): they keep it.
+UPDATE stations s SET needs_place = false
+FROM (
+    SELECT station_id
+    FROM (SELECT station_id,
+                 count(*) OVER (PARTITION BY mode, country, search_fold(name)) AS same_name
+          FROM stations) named
+    WHERE same_name = 1
+) unique_name
+WHERE s.station_id = unique_name.station_id AND s.needs_place
+  AND s.mode IN ('train', 'ferry', 'funicular');
 
 
 -- @step search names
@@ -680,6 +877,16 @@ FROM stations s,
      regexp_split_to_table(n.v, ';') AS part
 WHERE trim(part) <> '';
 
+-- A lift's or funicular's line or ski area with each of its names: "fløibanen" finds Fløyen,
+-- "val thorens" its lifts.
+INSERT INTO station_names (station_id, mode, name, city_prefixed)
+SELECT DISTINCT n.station_id, n.mode, p.prefix || ' ' || n.name, false
+FROM station_names n
+JOIN stations s USING (station_id)
+CROSS JOIN LATERAL (VALUES (s.line_name), (s.ski_area)) AS p(prefix)
+WHERE p.prefix IS NOT NULL AND NOT n.city_prefixed
+  AND n.folded NOT LIKE '%' || search_fold(p.prefix) || '%';
+
 -- The names of the other stops gathered into a station too: "agen gare sncf" finds the bus
 -- station whose stop that is.
 INSERT INTO station_names (station_id, mode, name, city_prefixed)
@@ -696,7 +903,8 @@ INSERT INTO station_names (station_id, mode, name, city_prefixed)
 SELECT DISTINCT n.station_id, n.mode, v.name, true
 FROM station_names n
 JOIN stations s USING (station_id)
-CROSS JOIN LATERAL (VALUES (s.city ->> 'name'), (s.city ->> 'name:en')) AS c(city)
+CROSS JOIN LATERAL (VALUES (s.city ->> 'name'), (s.city ->> 'name:en'),
+                           (s.settlement ->> 'name'), (s.settlement ->> 'name:en')) AS c(city)
 CROSS JOIN LATERAL (VALUES (c.city || ' ' || n.name), (n.name || ' ' || c.city)) AS v(name)
 WHERE c.city IS NOT NULL AND n.folded NOT LIKE '%' || search_fold(c.city) || '%';
 

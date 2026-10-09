@@ -26,7 +26,7 @@ BUILD_SQL = "/data/build.sql"
 INPUT = "/data/filtered.osm.pbf"
 TIMINGS = "/data/.build_timings.json"
 PLACES = "/data/places.csv"
-RAW_TABLES = ("stops", "rels", "boundaries")
+RAW_TABLES = ("stops", "rels", "boundaries", "line_ways", "ski_areas", "places")
 
 # For this session only: the API's connections keep the server defaults.
 SESSION = """

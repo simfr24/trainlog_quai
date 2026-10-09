@@ -9,12 +9,16 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 app = Flask(__name__)
-pool = ConnectionPool(os.environ["DATABASE_URL"], kwargs={"row_factory": dict_row}, open=True)
+# Each connection is checked before use: after the database restarts (a build changing its
+# settings), the pool's old connections are dead, and each would otherwise fail one search.
+pool = ConnectionPool(os.environ["DATABASE_URL"], kwargs={"row_factory": dict_row}, open=True,
+                      check=ConnectionPool.check_connection)
 
 COLUMNS = """
     s.station_id, s.station_key, s.mode, s.osm_type, s.osm_id, s.name, s.latin, s.names,
     s.city, s.region, s.country, ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
-    s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight, s.needs_place
+    s.wikidata, s.uic_ref, s.objects, s.lines, s.tracks, s.weight, s.needs_place,
+    s.line_name, s.ski_area, s.lift_end, s.settlement
 """
 
 
@@ -294,7 +298,9 @@ def route(relation_id):
 def nearest():
     """The nearest station of `mode` within `radius` metres of each point, for many at once:
     {mode, radius, points: [[lat, lng], ...]} gives {stations: [station or null, ...]} in
-    the points' order. What a trip's ends were, for a client tidying its station names."""
+    the points' order. What a trip's ends were, for a client tidying its station names.
+    With `candidates` (up to 10), each point has that many of the nearest instead, as a
+    list, nearest first: for a client to pick by name among stations close together."""
     body = request.get_json(silent=True) or {}
     mode, points = body.get("mode"), body.get("points") or []
     if not mode or not isinstance(points, list) or len(points) > 5000:
@@ -303,26 +309,35 @@ def nearest():
         lats = [float(p[0]) for p in points]
         lngs = [float(p[1]) for p in points]
         radius = min(float(body.get("radius") or 400), 2000)
+        candidates = min(max(int(body.get("candidates") or 1), 1), 10)
     except (TypeError, ValueError, IndexError):
         return jsonify(error="points are [lat, lng] pairs"), 400
     rows = query(
         f"""
-        SELECT p.i, {COLUMNS}
+        SELECT p.i, {COLUMNS},
+               ST_Distance(s.geom::geography,
+                           ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography) AS distance_m
         FROM unnest(%(lats)s::float8[], %(lngs)s::float8[]) WITH ORDINALITY AS p(lat, lng, i)
         CROSS JOIN LATERAL (
             SELECT * FROM stations s
             WHERE s.mode = %(mode)s
               AND s.geom && ST_Expand(ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326), %(degrees)s)
             ORDER BY s.geom <-> ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)
-            LIMIT 1
+            LIMIT %(candidates)s
         ) s
         WHERE ST_DWithin(s.geom::geography,
                          ST_SetSRID(ST_MakePoint(p.lng, p.lat), 4326)::geography, %(radius)s)
+        ORDER BY p.i, distance_m
         """,
         # The box around a point: radius in degrees of latitude, widened for longitude up to 70°.
-        {"lats": lats, "lngs": lngs, "mode": mode, "radius": radius,
+        {"lats": lats, "lngs": lngs, "mode": mode, "radius": radius, "candidates": candidates,
          "degrees": radius / 111320 * 3},
     )
+    if "candidates" in body:
+        stations = [[] for _ in points]
+        for row in with_labels(rows):
+            stations[row.pop("i") - 1].append(row)
+        return jsonify(stations=stations)
     stations = [None] * len(points)
     for row in with_labels(rows):
         stations[row.pop("i") - 1] = row

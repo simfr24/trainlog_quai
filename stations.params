@@ -4,7 +4,13 @@ nwr/public_transport
 nwr/highway=bus_stop
 nwr/amenity=bus_station,ferry_terminal
 nwr/aerialway=station
+# Lifts, funiculars and ski areas, for the names they are known by (Fløibanen, Val Thorens)
+w/aerialway
+w/railway=funicular
+wr/landuse=winter_sports
 # Lines, for the stop each one uses at a station
 r/route=subway,light_rail,monorail,tram,train
+# Settlements, which people know places by better than municipalities (Åndalsnes, in Rauma)
+n/place=city,town,village,hamlet
 # Place context: country, region, city
 r/boundary=administrative
