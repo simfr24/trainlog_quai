@@ -352,7 +352,7 @@ def route(relation_id):
 @app.post("/directions")
 def directions():
     """Where a vehicle stops at each station of a journey, by its direction of travel:
-    {mode, keys: [station_key or null, ...]} in the order travelled gives {positions: [[lat,
+    {mode, keys: [station_key or null, ...], ref?} in the order travelled gives {positions: [[lat,
     lng] or null, ...]}. Each station's is the stop position of a route relation (one per line
     and direction, in OSM) calling there and then at the next station; the last station's,
     the one of a relation calling at the one before and then there. Two tracks a few metres
@@ -360,7 +360,8 @@ def directions():
     its platforms (the stops by the kerb, each on its side of the road), which then do:
     beside the carriageway taken. Null where no relation runs between the two.
 
-    Of the relations running between two stations, the one running between most of the
+    Of the relations running between two stations, one of the line `ref` travelled, if given;
+    then the one running between most of the
     journey's: an interchange is served by other lines too, and line 5 also runs from Jaurès
     to Stalingrad, which put a line 2 journey on line 5's track there and sent the route
     round to turn back. A station with no stop position still counts towards that, through
@@ -379,7 +380,7 @@ def directions():
         """
         SELECT DISTINCT ON (p.i, ra.relation_id)
                p.i, ra.relation_id, rb.seq - ra.seq AS gap, sp.a::int + sp.b::int AS stop_positions,
-               ok.a AS a_ok, ok.b AS b_ok,
+               ok.a AS a_ok, ok.b AS b_ok, r.tags ->> 'ref' AS ref,
                ST_Y(oa.geom) AS alat, ST_X(oa.geom) AS alng,
                ST_Y(ob.geom) AS blat, ST_X(ob.geom) AS blng
         FROM unnest(%(idx)s::int[], %(a)s::text[], %(b)s::text[]) AS p(i, a, b)
@@ -389,6 +390,7 @@ def directions():
         JOIN route_stops rb ON rb.relation_id = ra.relation_id AND rb.seq > ra.seq
         JOIN station_objects ob ON ob.osm_type = rb.osm_type AND ob.osm_id = rb.osm_id
         JOIN stations sb ON sb.mode = ob.mode AND sb.key = ob.key AND sb.station_key = p.b
+        JOIN rels r ON r.relation_id = ra.relation_id
         CROSS JOIN LATERAL (VALUES
             (oa.tags ->> 'public_transport' = 'stop_position',
              ob.tags ->> 'public_transport' = 'stop_position')) AS sp(a, b)
@@ -403,12 +405,14 @@ def directions():
         {"mode": mode, "idx": [i for i, _, _ in pairs],
          "a": [a for _, a, _ in pairs], "b": [b for _, _, b in pairs]},
     )
+    line = (body.get("ref") or "").strip().lower()
     serves = {}
     for row in rows:
         serves[row["relation_id"]] = serves.get(row["relation_id"], 0) + 1
     best = {}
     for row in rows:
-        rank = (serves[row["relation_id"]], row["a_ok"] + row["b_ok"], row["stop_positions"], -row["gap"])
+        rank = (bool(line) and (row["ref"] or "").strip().lower() == line, serves[row["relation_id"]],
+                row["a_ok"] + row["b_ok"], row["stop_positions"], -row["gap"])
         if row["i"] not in best or rank > best[row["i"]][0]:
             best[row["i"]] = (rank, row)
     for i, _, _ in pairs:
