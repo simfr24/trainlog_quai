@@ -3,6 +3,7 @@
 import math
 import os
 import re
+import unicodedata
 
 from flask import Flask, jsonify, request
 from psycopg.rows import dict_row
@@ -32,15 +33,52 @@ def point_params():
     return {"lat": lat, "lon": lon}
 
 
+# The scripts each language's readers read besides Latin, as Unicode names their letters: a
+# name in them is shown as it is, rather than romanised.
+SCRIPTS = {"zh": ("CJK",), "ja": ("CJK", "HIRAGANA", "KATAKANA"), "ko": ("HANGUL",),
+           "ru": ("CYRILLIC",), "uk": ("CYRILLIC",)}
+# The name:<code> tags to read a language from where it is not simply its own (and its base
+# for a regional one, pt for pt-BR): Trainlog's Chinese is simplified, and Swiss German and
+# Norwegian are mostly mapped as German and Bokmål.
+LANG_KEYS = {"zh": ["zh-Hans", "zh"], "gsw": ["gsw", "de"], "no": ["no", "nb"]}
+
+
+def readable(text, lang):
+    """Whether readers of `lang` read every letter of `text`."""
+    scripts = ("LATIN",) + SCRIPTS.get(lang, ())
+    return all(unicodedata.name(ch, "").startswith(scripts) for ch in text or "" if ch.isalpha())
+
+
+def in_lang(names, lang):
+    if not lang:
+        return None
+    keys = LANG_KEYS.get(lang) or [lang, lang.split("-")[0]]
+    return next((names[f"name:{k}"] for k in keys if names.get(f"name:{k}")), None)
+
+
+def place_label(place, lang):
+    """A place's name in `lang`, else its own if in the reader's script, else in Latin."""
+    if not place:
+        return None
+    own = place.get("name") if readable(place.get("name"), lang) else None
+    return (in_lang(place, lang) or own or place.get("name:en") or place.get("latin")
+            or place.get("name"))
+
+
 def with_labels(rows):
-    """Add each station's `label`: its name in `lang` when asked for and mapped, else its
-    international Latin-script name."""
+    """Add each station's `label`, in `lang` when asked for: its name in that language where
+    mapped, else its own where in the reader's script (北京南 for Chinese and Japanese), else
+    its international Latin-script name. Its city and settlement get theirs, and its region
+    is given as its label alone."""
     lang = request.args.get("lang")
-    keys = [f"name:{lang}", f"name:{lang.split('-')[0]}"] if lang else []
     for row in rows:
         names = row["names"] or {}
-        row["label"] = next((names[k] for k in keys if names.get(k)), None) \
-            or row["latin"] or row["name"]
+        own = row["name"] if lang in SCRIPTS and readable(row["name"], lang) else None
+        row["label"] = in_lang(names, lang) or own or row["latin"] or row["name"]
+        for key in ("city", "settlement"):
+            if row.get(key):
+                row[key]["label"] = place_label(row[key], lang)
+        row["region"] = place_label(row.get("region"), lang)
     return rows
 
 
