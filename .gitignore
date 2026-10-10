@@ -7,3 +7,5 @@ filtered/
 .env
 # Trainlog's station usage export: counts of its users
 usage*.csv
+countries.geojson
+.tmp/

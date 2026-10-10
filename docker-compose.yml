@@ -7,10 +7,13 @@ services:
     # shared_buffers holds what searches read (about 4GB for the world), and pg_prewarm
     # reloads it after a restart, as the disk is a hard drive. wal_level=minimal: a table
     # created or rewritten whole is not written to the WAL as well, halving a build's
-    # writes; nothing here replicates, and a lost build is rebuilt from OSM.
+    # writes; nothing here replicates, and a lost build is rebuilt from OSM. A parallel worker
+    # per core (QUAI_CORES, set by the Makefile), and room for the build's connections, which
+    # run at once on every core (build.py) besides the API's, and for pg_prewarm's workers.
     command: >-
       postgres -c shared_buffers=${QUAI_SHARED_BUFFERS:-8GB} -c max_wal_size=16GB
-      -c max_parallel_workers=8 -c shared_preload_libraries=pg_prewarm
+      -c max_parallel_workers=${QUAI_CORES:-8} -c max_worker_processes=${QUAI_WORKERS:-16}
+      -c max_connections=${QUAI_CONNECTIONS:-100} -c shared_preload_libraries=pg_prewarm
       -c wal_level=minimal -c max_wal_senders=0
     # Parallel queries share memory through /dev/shm, 64MB by default.
     shm_size: 4gb
@@ -60,8 +63,8 @@ services:
       - sh
       - -c
       - >-
-        psql -qc 'DROP SCHEMA IF EXISTS build CASCADE; CREATE SCHEMA build'
-        && osm2pgsql --output=flex --schema=build --style=/data/flex.lua /data/filtered.osm.pbf
+        psql -qc 'DROP SCHEMA IF EXISTS raw CASCADE; CREATE SCHEMA raw'
+        && osm2pgsql --output=flex --schema=raw --style=/data/flex.lua --number-processes=$$(nproc) /data/filtered.osm.pbf
         && python3 /data/build.py
     depends_on:
       db:

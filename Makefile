@@ -12,6 +12,12 @@
 REGIONS ?= africa asia australia-oceania central-america europe north-america south-america
 FILTERED := $(foreach region,$(REGIONS),filtered/$(region).osm.pbf)
 
+# Postgres's parallel workers, one per core, and the background processes and connections
+# that allows (docker-compose.yml): the build runs a connection per core at once.
+export QUAI_CORES ?= $(shell nproc)
+export QUAI_WORKERS ?= $(shell echo $$(($(QUAI_CORES) + 8)))
+export QUAI_CONNECTIONS ?= $(shell echo $$((2 * $(QUAI_CORES) + 100)))
+
 # Kept between runs: re-downloading the world every time is what -N exists to avoid.
 .PRECIOUS: downloads/%-latest.osm.pbf filtered/%.osm.pbf
 
@@ -21,15 +27,17 @@ all: download
 
 # Fetches an extract if Geofabrik has a newer one, and keeps it only if it matches its
 # checksum. An interrupted download stays behind as a truncated file that -N considers
-# current, so a mismatch is downloaded again once before giving up.
+# current, so a mismatch is downloaded again once before giving up. A progress bar alone,
+# else a line per file: with -j, the jobs' bars and lines would overwrite each other.
+WGET_PROGRESS = $(if $(filter-out -j1,$(filter -j%,$(MAKEFLAGS))),-nv,-q --show-progress --progress=bar:force:noscroll)
 define fetch
 ( mkdir -p downloads/$(dir $(1)) && cd downloads/$(dir $(1)) \
-	&& wget -N -q --show-progress --progress=bar:force:noscroll \
+	&& wget -N $(WGET_PROGRESS) \
 		https://download.geofabrik.de/$(1)-latest.osm.pbf \
 		https://download.geofabrik.de/$(1)-latest.osm.pbf.md5 \
 	&& { md5sum -c --quiet $(notdir $(1))-latest.osm.pbf.md5 \
 		|| { rm -f $(notdir $(1))-latest.osm.pbf \
-			&& wget -q --show-progress --progress=bar:force:noscroll \
+			&& wget $(WGET_PROGRESS) \
 				https://download.geofabrik.de/$(1)-latest.osm.pbf \
 			&& md5sum -c --quiet $(notdir $(1))-latest.osm.pbf.md5; }; } )
 endef
@@ -55,14 +63,18 @@ filtered/%.osm.pbf: downloads/%-latest.osm.pbf stations.params
 filtered.osm.pbf: $(FILTERED)
 	osmium merge $^ -f pbf -o $@.tmp --overwrite && mv $@.tmp $@
 
-import: filtered.osm.pbf
+# Trainlog's country shapes, which the build gives each station its country from.
+countries.geojson:
+	curl -fsSL -o $@.tmp https://trainlog.me/static/data/countries-filtered.geojson && mv $@.tmp $@
+
+import: filtered.osm.pbf countries.geojson
 	docker compose run --rm --build import
 
-build:
-	docker compose run --rm --build import python3 /data/build.py --reuse
+build: countries.geojson
+	docker compose run --rm --build import python3 /data/build.py
 
 serve:
-	docker compose up -d --build api
+	docker compose up -d --build db api
 
 USAGE ?= usage.csv
 usage:
