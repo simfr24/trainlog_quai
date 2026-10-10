@@ -363,7 +363,10 @@ def directions():
     Of the relations running between two stations, the one running between most of the
     journey's: an interchange is served by other lines too, and line 5 also runs from Jaurès
     to Stalingrad, which put a line 2 journey on line 5's track there and sent the route
-    round to turn back. Then stop positions over platforms, then the fewest stops between."""
+    round to turn back. A station with no stop position still counts towards that, through
+    whatever the relation lists there: Medborgarplatsen, listed by its station node, alone
+    tells a line 18 journey from the red line's on the tracks beside it on to T-Centralen.
+    Then stop positions over platforms, then the fewest stops between."""
     body = request.get_json(silent=True) or {}
     mode, keys = body.get("mode"), body.get("keys")
     if not mode or not isinstance(keys, list) or len(keys) > 200:
@@ -376,6 +379,7 @@ def directions():
         """
         SELECT DISTINCT ON (p.i, ra.relation_id)
                p.i, ra.relation_id, rb.seq - ra.seq AS gap, sp.a::int + sp.b::int AS stop_positions,
+               ok.a AS a_ok, ok.b AS b_ok,
                ST_Y(oa.geom) AS alat, ST_X(oa.geom) AS alng,
                ST_Y(ob.geom) AS blat, ST_X(ob.geom) AS blng
         FROM unnest(%(idx)s::int[], %(a)s::text[], %(b)s::text[]) AS p(i, a, b)
@@ -388,11 +392,13 @@ def directions():
         CROSS JOIN LATERAL (VALUES
             (oa.tags ->> 'public_transport' = 'stop_position',
              ob.tags ->> 'public_transport' = 'stop_position')) AS sp(a, b)
-        WHERE (sp.a OR (%(mode)s = 'bus' AND (oa.tags ->> 'public_transport' = 'platform'
-                                              OR oa.tags ->> 'highway' = 'bus_stop')))
-          AND (sp.b OR (%(mode)s = 'bus' AND (ob.tags ->> 'public_transport' = 'platform'
-                                              OR ob.tags ->> 'highway' = 'bus_stop')))
-        ORDER BY p.i, ra.relation_id, sp.a::int + sp.b::int DESC, rb.seq - ra.seq
+        CROSS JOIN LATERAL (VALUES
+            (sp.a OR (%(mode)s = 'bus' AND (oa.tags ->> 'public_transport' = 'platform'
+                                            OR oa.tags ->> 'highway' = 'bus_stop')),
+             sp.b OR (%(mode)s = 'bus' AND (ob.tags ->> 'public_transport' = 'platform'
+                                            OR ob.tags ->> 'highway' = 'bus_stop')))) AS ok(a, b)
+        ORDER BY p.i, ra.relation_id, ok.a::int + ok.b::int DESC, sp.a::int + sp.b::int DESC,
+                 rb.seq - ra.seq
         """,
         {"mode": mode, "idx": [i for i, _, _ in pairs],
          "a": [a for _, a, _ in pairs], "b": [b for _, _, b in pairs]},
@@ -402,15 +408,16 @@ def directions():
         serves[row["relation_id"]] = serves.get(row["relation_id"], 0) + 1
     best = {}
     for row in rows:
-        rank = (serves[row["relation_id"]], row["stop_positions"], -row["gap"])
+        rank = (serves[row["relation_id"]], row["a_ok"] + row["b_ok"], row["stop_positions"], -row["gap"])
         if row["i"] not in best or rank > best[row["i"]][0]:
             best[row["i"]] = (rank, row)
     for i, _, _ in pairs:
         if i not in best:
             continue
         row = best[i][1]
-        positions[i] = [row["alat"], row["alng"]]
-        if i + 1 == len(keys) - 1 or positions[i + 1] is None:
+        if row["a_ok"]:
+            positions[i] = [row["alat"], row["alng"]]
+        if row["b_ok"] and (i + 1 == len(keys) - 1 or positions[i + 1] is None):
             positions[i + 1] = [row["blat"], row["blng"]]
     return jsonify(positions=positions)
 
