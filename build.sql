@@ -916,16 +916,20 @@ DROP TABLE unsaid;
 DROP TABLE places_near;
 
 CREATE TABLE unique_names AS
-SELECT station_id
+SELECT station_id, mode
 FROM (SELECT station_id, mode,
              count(*) OVER (PARTITION BY mode, country, search_fold(name)) AS same_name
       FROM stations) named
-WHERE same_name = 1 AND mode IN ('train', 'ferry', 'funicular');
+WHERE same_name = 1;
 
 UPDATE stations s SET needs_place = (s.city IS NOT NULL OR s.settlement IS NOT NULL)
     AND s.station_id NOT IN (SELECT station_id FROM place_said)
-    AND s.station_id NOT IN (SELECT station_id FROM named_after_places)
-    AND s.station_id NOT IN (SELECT station_id FROM unique_names);
+    -- A name taken from a nearby place says where only if no other station of the country has it:
+    -- the stops called "Bergen" in each German hamlet of that name need their municipality.
+    AND s.station_id NOT IN (SELECT station_id FROM named_after_places
+                             WHERE station_id IN (SELECT station_id FROM unique_names))
+    AND s.station_id NOT IN (SELECT station_id FROM unique_names
+                             WHERE mode IN ('train', 'ferry', 'funicular'));
 DROP TABLE station_runs;
 DROP TABLE place_said;
 DROP TABLE place_names;
