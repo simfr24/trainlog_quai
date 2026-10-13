@@ -39,6 +39,12 @@ CREATE MACRO near(a, b, m) AS ST_DWithin(a, b, m / 22264.0) AND dist_m(a, b) <= 
 CREATE MACRO without_quay(s) AS regexp_replace(s,
     '\s+\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$', '');
 
+-- Warsaw's (and other Polish ZTMs') stops are named for their pole: "Centrum 09" has the ref
+-- 701309, the stop 7013 and its pole 09. The pole is not part of the stop's name.
+CREATE MACRO without_pole(s, ref) AS
+    CASE WHEN regexp_full_match(ref, '[0-9]{6}') AND s LIKE '% ' || right(ref, 2)
+         THEN left(s, -3) ELSE s END;
+
 CREATE MACRO without_line(s) AS regexp_replace(s,
     '\s*[(\[](?:m[ée]tro|rer|tram(?:way)?|ligne|line|linie|lijn|linea|línea|u-?bahn|s-?bahn|'
     'stadtbahn|subway|bus|trolleybus)\b[^)\]]*[)\]]\s*$', '', 'i');
@@ -252,7 +258,7 @@ FROM (
     SELECT DISTINCT ON (o.mode, o.key)
            o.mode, o.key,
            search_fold(regexp_replace(
-               without_line(without_quay(COALESCE(o.tags['name'], area.tags['name']))),
+               without_line(without_quay(without_pole(COALESCE(o.tags['name'], area.tags['name']), o.tags['ref']))),
                '^.+?\s+-\s+', '')) AS name,
            o.geom
     FROM station_objects o
@@ -368,15 +374,15 @@ SELECT CAST(row_number() OVER (ORDER BY r.mode, r.key) AS INTEGER) AS station_id
        r.osm_type,
        r.osm_id,
        -- A station merged from several, not named after one of their lines.
-       CASE WHEN g.merged THEN without_line(without_quay(COALESCE(r.tags['name'], area.tags['name'])))
-            ELSE without_quay(COALESCE(r.tags['name'], area.tags['name'])) END AS name,
+       CASE WHEN g.merged THEN without_line(without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'])))
+            ELSE without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'])) END AS name,
        COALESCE(map_from_entries(list_transform(list_filter(
            map_entries(map_concat(COALESCE(area.tags, MAP {}), r.tags)), lambda e:
                -- name:<language>[-<script>], not the likes of name:source or name:etymology.
                regexp_full_match(e.key, 'name:[a-z]{2,3}([-_][A-Za-z]{2,4})?')
                OR e.key IN ('name', 'int_name', 'alt_name', 'official_name', 'short_name',
                             'loc_name', 'nat_name', 'reg_name', 'old_name')),
-           lambda e: {'key': e.key, 'value': without_quay(e.value)})), MAP {}) AS names,
+           lambda e: {'key': e.key, 'value': without_quay(without_pole(e.value, r.tags['ref']))})), MAP {}) AS names,
        g.wikidata,
        g.uic_ref,
        r.geom,
@@ -956,14 +962,14 @@ WHERE p.prefix IS NOT NULL
   AND search_fold(n.name) NOT LIKE '%' || search_fold(p.prefix) || '%';
 
 CREATE TABLE object_names AS
-SELECT DISTINCT st.station_id, st.mode, without_quay(o.tags['name']) AS name
+SELECT DISTINCT st.station_id, st.mode, without_quay(without_pole(o.tags['name'], o.tags['ref'])) AS name
 FROM stations st
 JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
 WHERE o.is_primary AND map_contains(o.tags, 'name') AND NOT is_quay_code(o.tags['name'])
   AND NOT EXISTS (SELECT 1 FROM own_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(o.tags['name']))
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'])))
   AND NOT EXISTS (SELECT 1 FROM line_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(o.tags['name']));
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'])));
 
 CREATE TABLE plain_names AS
 SELECT station_id, mode, name FROM own_names
