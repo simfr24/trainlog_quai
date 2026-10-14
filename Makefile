@@ -27,19 +27,27 @@ all: download
 
 # Fetches an extract if Geofabrik has a newer one, and keeps it only if it matches its
 # checksum. An interrupted download stays behind as a truncated file that -N considers
-# current, so a mismatch is downloaded again once before giving up. A progress bar and errors,
-# else a line per file and errors: with -j, the jobs' bars and lines would overwrite each other.
+# current, so a mismatch is downloaded again once before giving up. Hashing the world takes
+# minutes, so a passed check is kept as .verified, and skipped while that file still holds
+# the same checksum and is newer than the extract. Geofabrik serves each checksum either
+# itself or only from the mirror its extract redirects to, which names the dated file, so
+# the checksum is fetched from either and only its hash is compared. A progress bar and
+# errors, else a line per file and errors: with -j, the jobs' bars and lines would
+# overwrite each other.
 WGET_PROGRESS = $(if $(filter-out -j1,$(filter -j%,$(MAKEFLAGS))),-nv,-nv --show-progress --progress=bar:force:noscroll)
+MD5_OK = [ "$$(md5sum < $$f | cut -d' ' -f1)" = "$$(cut -d' ' -f1 $$f.md5)" ]
 define fetch
-( mkdir -p downloads/$(dir $(1)) && cd downloads/$(dir $(1)) \
-	&& wget -N $(WGET_PROGRESS) \
-		https://download.geofabrik.de/$(1)-latest.osm.pbf \
-		https://download.geofabrik.de/$(1)-latest.osm.pbf.md5 \
-	&& { md5sum -c --quiet $(notdir $(1))-latest.osm.pbf.md5 \
-		|| { rm -f $(notdir $(1))-latest.osm.pbf \
-			&& wget $(WGET_PROGRESS) \
-				https://download.geofabrik.de/$(1)-latest.osm.pbf \
-			&& md5sum -c --quiet $(notdir $(1))-latest.osm.pbf.md5; }; } )
+( mkdir -p downloads/$(dir $(1)) && cd downloads/$(dir $(1)) && f=$(notdir $(1))-latest.osm.pbf \
+	&& url=https://download.geofabrik.de/$(1)-latest.osm.pbf \
+	&& wget -N $(WGET_PROGRESS) $$url \
+	&& { wget -q -O $$f.md5.tmp $$url.md5 \
+		|| wget -nv -O $$f.md5.tmp "$$(curl -fsI $$url | sed -n 's/^location: *//Ip' | tr -d '\r').md5"; } \
+	&& mv $$f.md5.tmp $$f.md5 \
+	&& { { [ "$$(cut -d' ' -f1 $$f.md5)" = "$$(cat $$f.verified 2>/dev/null)" ] && [ $$f.verified -nt $$f ]; } \
+		|| { $(MD5_OK) \
+			|| { echo "$$f does not match its checksum, downloading it again" && rm -f $$f \
+				&& wget $(WGET_PROGRESS) $$url && $(MD5_OK); } \
+			&& cut -d' ' -f1 $$f.md5 > $$f.verified; }; } )
 endef
 
 download:
