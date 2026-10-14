@@ -27,9 +27,9 @@ all: download
 
 # Fetches an extract if Geofabrik has a newer one, and keeps it only if it matches its
 # checksum. An interrupted download stays behind as a truncated file that -N considers
-# current, so a mismatch is downloaded again once before giving up. A progress bar alone,
-# else a line per file: with -j, the jobs' bars and lines would overwrite each other.
-WGET_PROGRESS = $(if $(filter-out -j1,$(filter -j%,$(MAKEFLAGS))),-nv,-q --show-progress --progress=bar:force:noscroll)
+# current, so a mismatch is downloaded again once before giving up. A progress bar and errors,
+# else a line per file and errors: with -j, the jobs' bars and lines would overwrite each other.
+WGET_PROGRESS = $(if $(filter-out -j1,$(filter -j%,$(MAKEFLAGS))),-nv,-nv --show-progress --progress=bar:force:noscroll)
 define fetch
 ( mkdir -p downloads/$(dir $(1)) && cd downloads/$(dir $(1)) \
 	&& wget -N $(WGET_PROGRESS) \
