@@ -196,7 +196,7 @@ TO_POSTGRES = {
         SELECT mode, key, osm_type, osm_id, to_json(tags)::VARCHAR AS tags, ST_AsWKB(geom) AS geom,
                is_primary, source_key
         FROM station_objects""",
-    "station_names": "SELECT station_id, mode, name, city_prefixed, place FROM station_names",
+    "station_names": "SELECT station_id, mode, name, city_prefixed, place, code FROM station_names",
     "rel_members": "SELECT relation_id, is_stop_area, route, osm_type, osm_id, role, seq FROM rel_members",
     "route_stops": "SELECT relation_id, seq, osm_type, osm_id FROM route_stops",
     "line_routes": "SELECT relation_id, mode, to_json(tags)::VARCHAR AS tags FROM line_routes",
@@ -268,7 +268,7 @@ def publish(con):
     modes = [mode for (mode,) in con.execute("SELECT DISTINCT mode FROM station_names").fetchall()]
     concurrently([in_build + f"CREATE TABLE {table} AS {sql}" for table, sql in TYPED.items()] + [
         in_build + f"""CREATE TABLE station_names_{mode} AS
-            SELECT station_id::integer, mode::text, name::text, city_prefixed, place::text,
+            SELECT station_id::integer, mode::text, name::text, city_prefixed, place::text, code,
                    search_fold(name) AS folded
             FROM station_names_raw WHERE mode = '{mode}'""" for mode in modes])
     # DuckDB's text arrives as varchar, which the API's queries compare with text.
@@ -295,7 +295,7 @@ def publish(con):
         conn.execute("""
             CREATE TABLE station_names (
                 station_id integer, mode text, name text, city_prefixed boolean, place text,
-                folded text
+                code boolean, folded text
             ) PARTITION BY LIST (mode)
         """)
         for mode in modes:

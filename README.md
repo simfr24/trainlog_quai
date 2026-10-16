@@ -38,7 +38,10 @@ its own `name` where the reader's script is its script (北京南 for `zh` and `
 `latin`, its international Latin-script name (`int_name`, a Latin `name`, a mapped
 romanisation, a BGN/PCGN transliteration or Pinyin; see latin.py). Its `city` and
 `settlement` have a `label` chosen alike, and its `region` is given as its label. `matched` is the spelling the
-query matched, which may be in another language than the label. `needs_place` says the name
+query matched, which may be in another language than the label. A station is also found by
+its operators' codes (`railway:ref`, National Rail's `ref:crs`, SNCF's
+`ref:FR:sncf:resarail`) and its UIC code (`uic_ref`),
+typed whole: `KGX` for London King's Cross, `8727100` for Paris Nord. `needs_place` says the name
 does not tell where the station is ("Gare", "Gare de Lyon"), so that a client can prefix its
 `city` ("Royan - Gare"); it is false where any name of an enclosing boundary is in it already.
 

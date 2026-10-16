@@ -945,7 +945,8 @@ DROP TABLE unique_names;
 
 -- @step search names
 -- Every spelling to search on: its names, its lift's line or ski area before them, the names
--- of the other stops gathered into it, and each of these with its city before and after.
+-- of the other stops gathered into it, and each of these with its city before and after; and
+-- its operators' codes.
 CREATE TABLE own_names AS
 SELECT DISTINCT s.station_id, s.mode, trim(part) AS name
 FROM stations s,
@@ -978,11 +979,36 @@ SELECT station_id, mode, name FROM line_names
 UNION
 SELECT station_id, mode, name FROM object_names;
 
+-- The operators' codes of the station (DB's and Trafikverket's railway:ref, National Rail's
+-- ref:crs: "KGX" for London King's Cross, SNCF's ref:FR:sncf:resarail: "FRPNO" for Paris
+-- Nord) and its UIC code (8727100), on its station objects or its stop_area. Matched only
+-- whole: a code is no name that typing its first letters asks for.
+CREATE TABLE code_names AS
+SELECT DISTINCT c.station_id, c.mode, trim(part) AS name
+FROM (
+    SELECT st.station_id, st.mode, o.tags
+    FROM stations st
+    JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
+    WHERE o.is_primary
+    UNION ALL
+    SELECT st.station_id, st.mode, r.tags
+    FROM stations st, unnest(st.objects) AS u(object)
+    JOIN rels r ON r.relation_id = u.object.id
+    WHERE u.object.type = 'R'
+) c
+CROSS JOIN LATERAL (VALUES (c.tags['railway:ref']), (c.tags['ref:crs']),
+                             (c.tags['ref:FR:sncf:resarail']), (c.tags['uic_ref'])) AS v(code),
+     unnest(string_split(v.code, ';')) AS p(part)
+WHERE length(trim(part)) >= 2;
+
 CREATE TABLE station_names AS
-SELECT station_id, mode, name, false AS city_prefixed, NULL::VARCHAR AS place
+SELECT station_id, mode, name, false AS city_prefixed, NULL::VARCHAR AS place, false AS code
 FROM plain_names
 UNION ALL
-SELECT DISTINCT n.station_id, n.mode, v.name, true, v.place
+SELECT station_id, mode, name, false, NULL, true
+FROM code_names
+UNION ALL
+SELECT DISTINCT n.station_id, n.mode, v.name, true, v.place, false
 FROM plain_names n
 JOIN stations s USING (station_id)
 CROSS JOIN LATERAL (VALUES (s.city['name']), (s.city['name:en']),
@@ -994,3 +1020,4 @@ DROP TABLE own_names;
 DROP TABLE line_names;
 DROP TABLE object_names;
 DROP TABLE plain_names;
+DROP TABLE code_names;

@@ -117,6 +117,8 @@ def search():
         "exact_bonus": EXACT_BONUS,
         "fuzzy_min": FUZZY_MIN,
         "usage_weight": USAGE_WEIGHT,
+        # Typed in capitals ("MAN"), and not only digits: a code, rather than a name's start.
+        "capitals": q == q.upper() and q != q.lower(),
         **point_params(),
     }
     # Under three letters nearly every name shares a trigram with the query, so only
@@ -126,20 +128,25 @@ def search():
     mode_filter = "AND n.mode = %(mode)s" if mode else ""
     # Tiers, best first: whole words starting one of the station's names, city-prefixed or
     # not ("agen" in "Agen Gare", not in "Agence Commerciale": typing a city's name asks for
-    # its stations, the whole of it: "central" is not Central Bedfordshire's); the start of one of the station's names (the whole name counts
-    # EXACT_BONUS more importance, not a tier of its own: "Oslo", a stop in Alsace, is no
-    # better an answer than Oslo bussterminal); the start of a word in one ("montparnasse" in
-    # "Gare Montparnasse"); the start of a city-prefixed name ("berlin" in "Berlin
-    # Albrechtshof"); anything else matching. Within a tier the more important station comes
+    # its stations, the whole of it: "central" is not Central Bedfordshire's); the start of
+    # one of the station's names (the whole name counts EXACT_BONUS more importance, not a
+    # tier of its own: "Oslo", a stop in Alsace, is no better an answer than Oslo
+    # bussterminal), or the whole of one of its operators' codes ("KGX"), counting as its
+    # whole name: not above names it starts, as a name's first letters are often a code
+    # ("Ka", Kattarp's, not before Karlstad), unless typed in capitals, which asks for a
+    # code ("MAN", Manchester Piccadilly, before Mantes-la-Jolie: the first tier); the start
+    # of a word in one ("montparnasse" in "Gare Montparnasse"); the start of a city-prefixed
+    # name ("berlin" in "Berlin Albrechtshof"); anything else matching. Within a tier the more important station comes
     # first (its weight, and how many Trainlog users use it), but fuzzy matches go by score
-    # before that. Given a
-    # position (lat, lon), distance counts against importance: of the many stops named
-    # "Poste", the one nearby, not the slightly busier one across the country.
+    # before that. Given a position (lat, lon), distance counts against importance: of the
+    # many stops named "Poste", the one nearby, not the slightly busier one across the
+    # country.
     rows = query(
         f"""
         WITH matched AS (
             SELECT n.station_id, n.name,
                    CASE
+                       WHEN n.code THEN CASE WHEN %(capitals)s THEN 0 ELSE 1 END
                        WHEN (n.folded = search_fold(%(q)s)
                              OR n.folded LIKE search_fold(%(q)s) || ' %%')
                             AND (n.place IS NULL OR search_fold(%(q)s) = n.place
@@ -151,14 +158,15 @@ def search():
                        ELSE 4
                    END AS tier,
                    word_similarity(search_fold(%(q)s), n.folded) AS score,
-                   NOT n.city_prefixed AND n.folded = search_fold(%(q)s) AS exact
+                   NOT n.city_prefixed AND n.folded = search_fold(%(q)s) AS exact, n.code
             FROM station_names n
-            WHERE (n.folded LIKE search_fold(%(q)s) || '%%' {fuzzy}) {mode_filter}
+            WHERE (n.folded LIKE search_fold(%(q)s) || '%%' {fuzzy})
+              AND (NOT n.code OR n.folded = search_fold(%(q)s)) {mode_filter}
         ),
         best AS (
             SELECT station_id, min(tier) AS tier, round(max(score)::numeric, 1) AS score,
                    bool_or(exact) AS exact,
-                   (array_agg(name ORDER BY tier, score DESC, length(name)))[1] AS matched
+                   (array_agg(name ORDER BY tier, score DESC, code, length(name)))[1] AS matched
             FROM matched
             GROUP BY station_id
         )
