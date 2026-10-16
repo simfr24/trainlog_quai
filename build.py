@@ -26,6 +26,8 @@ import duckdb
 import psycopg
 
 from latin import latin_name
+from progress import TTY, Live, bar, dim, green, red, spinner
+from progress import duration as short_duration
 from usage import follow_redirects
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -405,26 +407,69 @@ def main():
     con = duckdb.connect()
     con.execute(f"SET threads = {CORES}")
     con.execute(f"SET temp_directory = '{os.path.join(HERE, '.tmp')}'")
+    # Its own would be drawn over the steps' (progress.py).
+    con.execute("SET enable_progress_bar = false")
     for extension in ("spatial", "postgres"):
         con.install_extension(extension)
         con.load_extension(extension)
     # Empty: libpq's environment says where, as for psycopg.
     con.execute("ATTACH '' AS pg (TYPE postgres)")
 
+    # Each step's time in the last build, against which the running one's progress is told.
+    try:
+        with open(TIMINGS) as f:
+            previous = json.load(f)
+    except (OSError, ValueError):
+        previous = {}
+    steps = load_steps(BUILD_SQL) + [("publish", "-- @python publish")]
     timings = {}
     started = time.monotonic()
-    for i, (label, sql) in enumerate(load_steps(BUILD_SQL) + [("publish", "-- @python publish")]):
-        print(f"[{i + 1:2}] {label:<26}", end=" ", flush=True)
-        step_started = time.monotonic()
-        function = re.search(r"--\s*@python\s+(\w+)", sql)
-        if function:
-            globals()[function.group(1)](con)
-        elif "{part}" in sql:
-            in_parts(con, sql)
-        else:
-            con.execute(sql)
-        timings[label] = time.monotonic() - step_started
-        print(f"{duration(timings[label]):>8}", flush=True)
+    current = {"step": 0, "label": "", "started": started}
+
+    def render():
+        i, label = current["step"], current["label"]
+        if label is None:
+            return []
+        elapsed = time.monotonic() - current["started"]
+        expected = previous.get(label)
+        progress = min(elapsed / expected, 0.99) if expected else None
+        step = (f"{spinner()} [{i + 1:2}] {label:<26} {bar(progress)} "
+                + dim(f"{short_duration(elapsed)}" + (f" / ~{short_duration(expected)}" if expected else "")))
+        # What is left: the steps to come as long as they took last time, and the rest of
+        # this one; unknown without a last build.
+        left = sum(previous.get(later, 0) for later, _ in steps[i + 1:]) + max((expected or 0) - elapsed, 0)
+        total = time.monotonic() - started
+        overall = total / (total + left) if previous else None
+        footer = (f"  {i}/{len(steps)} steps  {bar(overall, 20)}  {short_duration(total)}"
+                  + (f", about {short_duration(left)} left" if previous else ""))
+        return [step, dim(footer)]
+
+    # Without a terminal, as a log wants it: a line per step, its time once done.
+    with Live(render) as live:
+        for i, (label, sql) in enumerate(steps):
+            current.update(step=i, label=label, started=time.monotonic())
+            if not TTY:
+                print(f"[{i + 1:2}] {label:<26}", end=" ", flush=True)
+            function = re.search(r"--\s*@python\s+(\w+)", sql)
+            try:
+                if function:
+                    globals()[function.group(1)](con)
+                elif "{part}" in sql:
+                    in_parts(con, sql)
+                else:
+                    con.execute(sql)
+            except BaseException:
+                if TTY:
+                    live.log(f"{red('✘')} [{i + 1:2}] {label:<26} "
+                             + red(f"failed after {duration(time.monotonic() - current['started'])}"))
+                current["label"] = None
+                raise
+            timings[label] = time.monotonic() - current["started"]
+            if TTY:
+                live.log(f"{green('✔')} [{i + 1:2}] {label:<26} {duration(timings[label]):>8}")
+            else:
+                print(f"{duration(timings[label]):>8}", flush=True)
+        current["label"] = None
 
     total = time.monotonic() - started
     print(f"Built and live in {duration(total)}"

@@ -18,58 +18,20 @@ export QUAI_CORES ?= $(shell nproc)
 export QUAI_WORKERS ?= $(shell echo $$(($(QUAI_CORES) + 8)))
 export QUAI_CONNECTIONS ?= $(shell echo $$((2 * $(QUAI_CORES) + 100)))
 
-# Kept between runs: re-downloading the world every time is what -N exists to avoid.
-.PRECIOUS: downloads/%-latest.osm.pbf filtered/%.osm.pbf
-
-all: download
+all:
 	$(MAKE) import
 	$(MAKE) serve
 
-# Fetches an extract if Geofabrik has a newer one, and keeps it only if it matches its
-# checksum. An interrupted download stays behind as a truncated file that -N considers
-# current, so a mismatch is downloaded again once before giving up. Hashing the world takes
-# minutes, so a passed check is kept as .verified, and skipped while that file still holds
-# the same checksum and is newer than the extract. Geofabrik serves each checksum either
-# itself or only from the mirror its extract redirects to, which names the dated file, so
-# the checksum is fetched from either and only its hash is compared. A progress bar and
-# errors, else a line per file and errors: with -j, the jobs' bars and lines would
-# overwrite each other.
-WGET_PROGRESS = $(if $(filter-out -j1,$(filter -j%,$(MAKEFLAGS))),-nv,-nv --show-progress --progress=bar:force:noscroll)
-MD5_OK = [ "$$(md5sum < $$f | cut -d' ' -f1)" = "$$(cut -d' ' -f1 $$f.md5)" ]
-define fetch
-( mkdir -p downloads/$(dir $(1)) && cd downloads/$(dir $(1)) && f=$(notdir $(1))-latest.osm.pbf \
-	&& url=https://download.geofabrik.de/$(1)-latest.osm.pbf \
-	&& wget -N $(WGET_PROGRESS) $$url \
-	&& { wget -q -O $$f.md5.tmp $$url.md5 \
-		|| wget -nv -O $$f.md5.tmp "$$(curl -fsI $$url | sed -n 's/^location: *//Ip' | tr -d '\r').md5"; } \
-	&& mv $$f.md5.tmp $$f.md5 \
-	&& { { [ "$$(cut -d' ' -f1 $$f.md5)" = "$$(cat $$f.verified 2>/dev/null)" ] && [ $$f.verified -nt $$f ]; } \
-		|| { $(MD5_OK) \
-			|| { echo "$$f does not match its checksum, downloading it again" && rm -f $$f \
-				&& wget $(WGET_PROGRESS) $$url && $(MD5_OK); } \
-			&& cut -d' ' -f1 $$f.md5 > $$f.verified; }; } )
-endef
-
+# Fetching and filtering the extracts is regions.py's: every region at once, a line each,
+# filtering as many as -j allows. An extract is only downloaded again when Geofabrik has a
+# newer one, and an interrupted download resumes.
 download:
-	@$(foreach region,$(REGIONS),$(call fetch,$(region)) &&) true
-
-downloads/%-latest.osm.pbf:
-	@$(call fetch,$*)
-
-# Written under a temporary name and renamed once complete, so an interrupted or failed
-# filter never leaves a file that make would take for a finished one. One line when each
-# finishes: with -j, progress bars would overwrite each other.
-filtered/%.osm.pbf: downloads/%-latest.osm.pbf stations.params
-	@mkdir -p $(dir $@)
-	@echo "filtering $*..."
-	@start=$$(date +%s); \
-		osmium tags-filter --no-progress --expressions=stations.params $< -f pbf -o $@.tmp --overwrite \
-		&& mv $@.tmp $@ \
-		&& echo "filtered $* in $$(( $$(date +%s) - start ))s, $$(du -h $@ | cut -f1)"
+	python3 regions.py --download-only $(REGIONS)
 
 # Always merged afresh: the regions may have changed since the last run.
-filtered.osm.pbf: $(FILTERED)
-	osmium merge $^ -f pbf -o $@.tmp --overwrite && mv $@.tmp $@
+filtered.osm.pbf: stations.params
+	python3 regions.py $(REGIONS)
+	osmium merge $(FILTERED) -f pbf -o $@.tmp --overwrite && mv $@.tmp $@
 
 # Trainlog's country shapes, which the build gives each station its country from.
 countries.geojson:
