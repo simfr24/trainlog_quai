@@ -979,10 +979,19 @@ SELECT station_id, mode, name FROM line_names
 UNION
 SELECT station_id, mode, name FROM object_names;
 
--- The operators' codes of the station (DB's and Trafikverket's railway:ref, National Rail's
--- ref:crs: "KGX" for London King's Cross, SNCF's ref:FR:sncf:resarail: "FRPNO" for Paris
--- Nord) and its UIC code (8727100), on its station objects or its stop_area. Matched only
--- whole: a code is no name that typing its first letters asks for.
+-- The codes of the station: its operators' (railway:ref, and railway:ref:<operator> as DB's,
+-- NMBS/SNCB's or ÖBB's, but not its parent station's, a count or a translation; National
+-- Rail's ref:crs, "KGX" for London King's Cross, and ref:tiploc; SNCF's resarail, "FRPNO"
+-- for Paris Nord; Amtrak's), its UIC code (8727100), IBNR (8000105) and ESR number, on its
+-- station objects or its stop_area. Matched only whole: a code is no name that typing its
+-- first letters asks for.
+CREATE MACRO is_code_key(k) AS
+    k IN ('railway:ref', 'ref:crs', 'ref:tiploc', 'ref:FR:sncf:resarail', 'ref:amtrak',
+          'uic_ref', 'ref:ibnr', 'esr:user')
+    OR (regexp_full_match(k, 'railway:ref:.+')
+        AND k NOT IN ('railway:ref:parent', 'railway:ref:count')
+        AND NOT regexp_full_match(k, 'railway:ref:([a-z]{2}|[0-9]+)'));
+
 CREATE TABLE code_names AS
 SELECT DISTINCT c.station_id, c.mode, trim(part) AS name
 FROM (
@@ -995,11 +1004,15 @@ FROM (
     FROM stations st, unnest(st.objects) AS u(object)
     JOIN rels r ON r.relation_id = u.object.id
     WHERE u.object.type = 'R'
-) c
-CROSS JOIN LATERAL (VALUES (c.tags['railway:ref']), (c.tags['ref:crs']),
-                             (c.tags['ref:FR:sncf:resarail']), (c.tags['uic_ref'])) AS v(code),
-     unnest(string_split(v.code, ';')) AS p(part)
-WHERE length(trim(part)) >= 2;
+) c,
+     unnest(map_entries(c.tags)) AS t(tag),
+     unnest(string_split(tag.value, ';')) AS p(part)
+WHERE is_code_key(tag.key) AND length(trim(part)) >= 2
+  -- Where there is none, "no" or "?" (not "NO", Nointel - Mours's); ESR numbers are six
+  -- digits.
+  AND trim(part) NOT IN ('no', 'none', 'yes', 'unknown', 'нет')
+  AND regexp_matches(trim(part), '[[:alnum:]]')
+  AND (tag.key <> 'esr:user' OR regexp_full_match(trim(part), '[0-9]{6}'));
 
 CREATE TABLE station_names AS
 SELECT station_id, mode, name, false AS city_prefixed, NULL::VARCHAR AS place, false AS code
@@ -1021,3 +1034,4 @@ DROP TABLE line_names;
 DROP TABLE object_names;
 DROP TABLE plain_names;
 DROP TABLE code_names;
+DROP MACRO is_code_key;
