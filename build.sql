@@ -39,11 +39,16 @@ CREATE MACRO near(a, b, m) AS ST_DWithin(a, b, m / 22264.0) AND dist_m(a, b) <= 
 CREATE MACRO without_quay(s) AS regexp_replace(s,
     '\s+\((?:(?:[Qq]uai|[Qq]uay|[Bb]ay|[Ss]tand|[Vv]oie|[Pp]latform|[Pp]lateforme)\s+)?([A-Z]{1,2}[0-9]{0,2}|[0-9]{1,2}[A-Z]?)\)$', '');
 
--- Warsaw's (and other Polish ZTMs') stops are named for their pole: "Centrum 09" has the ref
--- 701309, the stop 7013 and its pole 09. The pole is not part of the stop's name.
-CREATE MACRO without_pole(s, ref) AS
-    CASE WHEN regexp_full_match(ref, '[0-9]{6}') AND s LIKE '% ' || right(ref, 2)
-         THEN left(s, -3) ELSE s END;
+-- Polish networks name their stops for their pole: Warsaw's "Centrum 09", Kraków's "Bronowice
+-- SKA 04", Lublin's "Park Bronowice 02". The pole is the stop's quay, not part of its name. Its
+-- ref does not always tell it (701309, 359-04, 3112, often none), so it is read off the name of
+-- every stop in Poland (stops.poles) ending in two digits, but a number ("Szkoła nr 12").
+CREATE MACRO pole_of(s, poles) AS CASE
+    WHEN poles AND regexp_matches(s, '\s[0-9]{2}$')
+         AND NOT regexp_matches(s, '\b(?:[Nn]r|[Nn]o)\.?\s*[0-9]{2}$') THEN right(s, 2) END;
+
+CREATE MACRO without_pole(s, poles) AS
+    CASE WHEN pole_of(s, poles) IS NOT NULL THEN rtrim(left(s, -2)) ELSE s END;
 
 CREATE MACRO without_line(s) AS regexp_replace(s,
     '\s*[(\[](?:m[ée]tro|rer|tram(?:way)?|ligne|line|linie|lijn|linea|línea|u-?bahn|s-?bahn|'
@@ -116,6 +121,28 @@ CREATE TABLE places AS
 SELECT node_id, place, json_transform(tags, '"MAP(VARCHAR, VARCHAR)"') AS tags,
        ST_GeomFromWKB(wkb) AS geom
 FROM postgres_query('pg', 'SELECT node_id, place, tags::text, ST_AsBinary(geom) AS wkb FROM {raw}.places');
+
+
+-- @step polish stops
+-- The stops in Poland, as Trainlog's countries draw it, whose names end in their pole.
+CREATE TABLE poland AS
+SELECT unnest(ST_Dump(ST_Subdivide(geom, 256))).geom AS geom
+FROM (SELECT ST_GeomFromGeoJSON(f.geometry) AS geom
+      FROM (SELECT unnest(features) AS f
+            FROM read_json('{here}/countries.geojson', maximum_object_size = 1000000000,
+                           columns = {'features': 'STRUCT(properties STRUCT(countryCode VARCHAR), geometry JSON)[]'}))
+      WHERE f.properties.countryCode = 'PL');
+CREATE TABLE polish_stops AS
+SELECT DISTINCT s.osm_type, s.osm_id
+FROM stops s
+JOIN poland p ON ST_Intersects(p.geom, s.geom)
+WHERE ST_X(s.geom) BETWEEN 14 AND 24.5 AND ST_Y(s.geom) BETWEEN 48.9 AND 55;
+ALTER TABLE stops ADD COLUMN poles BOOLEAN DEFAULT false;
+UPDATE stops s SET poles = true
+FROM polish_stops p
+WHERE s.osm_type = p.osm_type AND s.osm_id = p.osm_id;
+DROP TABLE poland;
+DROP TABLE polish_stops;
 
 
 -- @step relation members
@@ -223,7 +250,7 @@ WITH object_area AS (
     GROUP BY rm.osm_type, rm.osm_id
 )
 SELECT sm.mode, k.key, s.osm_type, s.osm_id, s.tags, s.geom,
-       is_primary_stop(s.tags) AS is_primary, k.key AS source_key
+       is_primary_stop(s.tags) AS is_primary, k.key AS source_key, s.poles
 FROM stop_modes sm
 JOIN stops s USING (osm_type, osm_id)
 LEFT JOIN object_area oa USING (osm_type, osm_id)
@@ -234,7 +261,7 @@ CROSS JOIN LATERAL (SELECT COALESCE('A' || oa.group_id, 'Q' || s.tags['wikidata'
 -- Stop positions often carry no mode tag; inside a stop_area they belong to its stations.
 -- Not its entrances, which say nothing about where trains stop.
 INSERT INTO station_objects
-SELECT DISTINCT a.mode, a.key, s.osm_type, s.osm_id, s.tags, s.geom, false, a.key
+SELECT DISTINCT a.mode, a.key, s.osm_type, s.osm_id, s.tags, s.geom, false, a.key, s.poles
 FROM (SELECT DISTINCT mode, key FROM station_objects WHERE key LIKE 'A%') a
 JOIN area_group ag ON ag.group_id = CAST(substr(a.key, 2) AS BIGINT)
 JOIN rel_members rm ON rm.relation_id = ag.relation_id
@@ -242,6 +269,23 @@ JOIN stops s ON s.osm_type = rm.osm_type AND s.osm_id = rm.osm_id
 WHERE NOT EXISTS (SELECT 1 FROM stop_modes sm WHERE sm.osm_type = s.osm_type AND sm.osm_id = s.osm_id)
   AND COALESCE(s.tags['railway'], '') NOT IN ('subway_entrance', 'train_station_entrance')
   AND NOT map_contains(s.tags, 'entrance');
+
+-- @step stop areas without a stop
+-- A Polish stop_area, named for its pole, with only platforms and stop positions of a mode is
+-- that mode's pole still: Kraków's "Głowackiego 02", whose buses call at its tram platform.
+-- One of them founds its station, rather than its calls, and its pole, going to another.
+UPDATE station_objects o SET is_primary = true
+FROM (
+    SELECT DISTINCT ON (o.mode, o.key) o.mode, o.key, o.osm_type, o.osm_id
+    FROM station_objects o
+    JOIN rels area ON area.relation_id = CASE WHEN o.key LIKE 'A%' THEN CAST(substr(o.key, 2) AS BIGINT) END
+    WHERE o.poles AND area.tags['name'] IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM station_objects p
+                      WHERE p.mode = o.mode AND p.key = o.key AND p.is_primary)
+    ORDER BY o.mode, o.key, (o.tags['public_transport'] = 'platform') IS TRUE DESC,
+             map_contains(o.tags, 'name') DESC, o.osm_type, o.osm_id
+) f
+WHERE o.mode = f.mode AND o.key = f.key AND o.osm_type = f.osm_type AND o.osm_id = f.osm_id;
 
 -- @step merge nearby duplicates
 -- One station is often several same-named groups close together: a bus stop per side of the
@@ -258,7 +302,7 @@ FROM (
     SELECT DISTINCT ON (o.mode, o.key)
            o.mode, o.key,
            search_fold(regexp_replace(
-               without_line(without_quay(without_pole(COALESCE(o.tags['name'], area.tags['name']), o.tags['ref']))),
+               without_line(without_quay(without_pole(COALESCE(o.tags['name'], area.tags['name']), o.poles))),
                '^.+?\s+-\s+', '')) AS name,
            o.geom
     FROM station_objects o
@@ -344,7 +388,7 @@ DROP TABLE absorbed_stops;
 -- routes (weights).
 CREATE TABLE stations AS
 WITH rep AS (
-    SELECT DISTINCT ON (mode, key) mode, key, osm_type, osm_id, tags, geom
+    SELECT DISTINCT ON (mode, key) mode, key, osm_type, osm_id, tags, geom, poles
     FROM station_objects
     WHERE is_primary
     ORDER BY mode, key, (tags['amenity'] = 'bus_station') IS TRUE DESC,
@@ -374,15 +418,15 @@ SELECT CAST(row_number() OVER (ORDER BY r.mode, r.key) AS INTEGER) AS station_id
        r.osm_type,
        r.osm_id,
        -- A station merged from several, not named after one of their lines.
-       CASE WHEN g.merged THEN without_line(without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'])))
-            ELSE without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'])) END AS name,
+       CASE WHEN g.merged THEN without_line(without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.poles)))
+            ELSE without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.poles)) END AS name,
        COALESCE(map_from_entries(list_transform(list_filter(
            map_entries(map_concat(COALESCE(area.tags, MAP {}), r.tags)), lambda e:
                -- name:<language>[-<script>], not the likes of name:source or name:etymology.
                regexp_full_match(e.key, 'name:[a-z]{2,3}([-_][A-Za-z]{2,4})?')
                OR e.key IN ('name', 'int_name', 'alt_name', 'official_name', 'short_name',
                             'loc_name', 'nat_name', 'reg_name', 'old_name')),
-           lambda e: {'key': e.key, 'value': without_quay(without_pole(e.value, r.tags['ref']))})), MAP {}) AS names,
+           lambda e: {'key': e.key, 'value': without_quay(without_pole(e.value, r.poles))})), MAP {}) AS names,
        g.wikidata,
        g.uic_ref,
        r.geom,
@@ -737,6 +781,7 @@ FROM (
             COALESCE(o.tags['railway:track_ref'], o.tags['local_ref'],
                      quay_code(o.tags['name']),
                      quay_of(o.tags['name']),
+                     pole_of(o.tags['name'], o.poles),
                      -- A bus or ferry stop's ref is its network's stop code, not a quay.
                      CASE WHEN st.mode NOT IN ('bus', 'ferry') THEN o.tags['ref'] END), ';')) AS part) r
         WHERE st.mode IN ('train', 'metro', 'tram', 'funicular', 'bus', 'ferry')
@@ -963,14 +1008,14 @@ WHERE p.prefix IS NOT NULL
   AND search_fold(n.name) NOT LIKE '%' || search_fold(p.prefix) || '%';
 
 CREATE TABLE object_names AS
-SELECT DISTINCT st.station_id, st.mode, without_quay(without_pole(o.tags['name'], o.tags['ref'])) AS name
+SELECT DISTINCT st.station_id, st.mode, without_quay(without_pole(o.tags['name'], o.poles)) AS name
 FROM stations st
 JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
 WHERE o.is_primary AND map_contains(o.tags, 'name') AND NOT is_quay_code(o.tags['name'])
   AND NOT EXISTS (SELECT 1 FROM own_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'])))
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.poles)))
   AND NOT EXISTS (SELECT 1 FROM line_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'])));
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.poles)));
 
 CREATE TABLE plain_names AS
 SELECT station_id, mode, name FROM own_names
