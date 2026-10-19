@@ -47,8 +47,14 @@ CREATE MACRO pole_of(s, poles) AS CASE
     WHEN poles AND regexp_matches(s, '\s[0-9]{2}$')
          AND NOT regexp_matches(s, '\b(?:[Nn]r|[Nn]o)\.?\s*[0-9]{2}$') THEN right(s, 2) END;
 
-CREATE MACRO without_pole(s, poles) AS
-    CASE WHEN pole_of(s, poles) IS NOT NULL THEN rtrim(left(s, -2)) ELSE s END;
+-- Puławy's (MZK) end in their own stop code instead, a ref of three or four digits: "Bronowice -
+-- Skrzyżowanie 1532", ref 1532. A code, which no sign shows, rather than a quay. Not a number the
+-- ref does not repeat: that is the house the stop is by ("Opoczyńska 145").
+CREATE MACRO without_pole(s, ref, poles) AS CASE
+    WHEN pole_of(s, poles) IS NOT NULL THEN rtrim(left(s, -2))
+    WHEN poles AND regexp_full_match(ref, '[0-9]{3,}') AND s LIKE '% ' || ref
+        THEN rtrim(left(s, -length(ref)))
+    ELSE s END;
 
 CREATE MACRO without_line(s) AS regexp_replace(s,
     '\s*[(\[](?:m[ée]tro|rer|tram(?:way)?|ligne|line|linie|lijn|linea|línea|u-?bahn|s-?bahn|'
@@ -302,7 +308,7 @@ FROM (
     SELECT DISTINCT ON (o.mode, o.key)
            o.mode, o.key,
            search_fold(regexp_replace(
-               without_line(without_quay(without_pole(COALESCE(o.tags['name'], area.tags['name']), o.poles))),
+               without_line(without_quay(without_pole(COALESCE(o.tags['name'], area.tags['name']), o.tags['ref'], o.poles))),
                '^.+?\s+-\s+', '')) AS name,
            o.geom
     FROM station_objects o
@@ -418,15 +424,15 @@ SELECT CAST(row_number() OVER (ORDER BY r.mode, r.key) AS INTEGER) AS station_id
        r.osm_type,
        r.osm_id,
        -- A station merged from several, not named after one of their lines.
-       CASE WHEN g.merged THEN without_line(without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.poles)))
-            ELSE without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.poles)) END AS name,
+       CASE WHEN g.merged THEN without_line(without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'], r.poles)))
+            ELSE without_quay(without_pole(COALESCE(r.tags['name'], area.tags['name']), r.tags['ref'], r.poles)) END AS name,
        COALESCE(map_from_entries(list_transform(list_filter(
            map_entries(map_concat(COALESCE(area.tags, MAP {}), r.tags)), lambda e:
                -- name:<language>[-<script>], not the likes of name:source or name:etymology.
                regexp_full_match(e.key, 'name:[a-z]{2,3}([-_][A-Za-z]{2,4})?')
                OR e.key IN ('name', 'int_name', 'alt_name', 'official_name', 'short_name',
                             'loc_name', 'nat_name', 'reg_name', 'old_name')),
-           lambda e: {'key': e.key, 'value': without_quay(without_pole(e.value, r.poles))})), MAP {}) AS names,
+           lambda e: {'key': e.key, 'value': without_quay(without_pole(e.value, r.tags['ref'], r.poles))})), MAP {}) AS names,
        g.wikidata,
        g.uic_ref,
        r.geom,
@@ -1008,14 +1014,14 @@ WHERE p.prefix IS NOT NULL
   AND search_fold(n.name) NOT LIKE '%' || search_fold(p.prefix) || '%';
 
 CREATE TABLE object_names AS
-SELECT DISTINCT st.station_id, st.mode, without_quay(without_pole(o.tags['name'], o.poles)) AS name
+SELECT DISTINCT st.station_id, st.mode, without_quay(without_pole(o.tags['name'], o.tags['ref'], o.poles)) AS name
 FROM stations st
 JOIN station_objects o ON o.mode = st.mode AND o.key = st.key
 WHERE o.is_primary AND map_contains(o.tags, 'name') AND NOT is_quay_code(o.tags['name'])
   AND NOT EXISTS (SELECT 1 FROM own_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.poles)))
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'], o.poles)))
   AND NOT EXISTS (SELECT 1 FROM line_names n
-                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.poles)));
+                  WHERE n.station_id = st.station_id AND n.name = without_quay(without_pole(o.tags['name'], o.tags['ref'], o.poles)));
 
 CREATE TABLE plain_names AS
 SELECT station_id, mode, name FROM own_names
