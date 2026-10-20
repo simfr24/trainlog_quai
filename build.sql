@@ -775,8 +775,10 @@ UPDATE stations s SET tracks = t.tracks
 FROM (
     WITH refs AS (
         SELECT st.station_id,
-               regexp_replace(trim(r.part),
-                   '^(voie|gleis|gl\.?|track|platform|quai|binario|v[ií]a|spoor|tor|peron)\s*', '', 'i') AS ref,
+               -- "1Est" written "1 Est", as its other objects are.
+               regexp_replace(regexp_replace(trim(r.part),
+                   '^(voie|gleis|gl\.?|track|platform|quai|binario|v[ií]a|spoor|tor|peron)\s*', '', 'i'),
+                   '^([0-9]+)\s*(\pL{3,})$', '\1 \2') AS ref,
                (o.tags['public_transport'] = 'stop_position' OR ps.station_id IS NOT NULL) IS TRUE AS on_track,
                COALESCE(ps.stop_geom, o.geom) AS geom, st.geom AS station_geom
         FROM stations st
@@ -795,15 +797,20 @@ FROM (
                OR o.tags['railway'] = 'platform' OR o.tags['highway'] = 'bus_stop')
     ),
     best AS (
-        SELECT DISTINCT ON (station_id, ref) station_id, ref, on_track, geom
+        SELECT DISTINCT ON (station_id, ref) station_id, ref, on_track, geom,
+               -- The part of the station named after a track's number, whose tracks are listed
+               -- after the plain ones; "bis", "ter" and "quater" stay beside their number.
+               CASE WHEN lower(split_part(ref, ' ', 2)) NOT IN ('bis', 'ter', 'quater')
+                    THEN lower(split_part(ref, ' ', 2)) ELSE '' END AS part
         FROM refs
-        -- Shaped like a track: "7", "112", "12a", "A", "M3".
-        WHERE regexp_full_match(ref, '([0-9]{1,3}|[0-9]{1,2}[A-Za-z]|[A-Za-z]{1,2}[0-9]{0,2})')
+        -- Shaped like a track: "7", "112", "12a", "A", "M3", or a number and a word: "3 bis", or
+        -- the part of the station it is in, "1 Ovest" and "1 Est" at Bologna Centrale.
+        WHERE regexp_full_match(ref, '([0-9]{1,3}|[0-9]{1,2}[A-Za-z]|[A-Za-z]{1,2}[0-9]{0,2}|[0-9]{1,3} \pL{3,})')
         ORDER BY station_id, ref, on_track DESC, ST_Distance(geom, station_geom)
     )
     SELECT station_id,
            list({'ref': ref, 'lat': round(ST_Y(geom), 6), 'lng': round(ST_X(geom), 6), 'on_track': on_track}
-                ORDER BY length(ref), ref) AS tracks
+                ORDER BY part, try_cast(regexp_extract(ref, '^[0-9]+') AS INTEGER) NULLS LAST, ref) AS tracks
     FROM best
     GROUP BY station_id
 ) t

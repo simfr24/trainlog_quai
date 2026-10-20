@@ -48,4 +48,6 @@ does not tell where the station is ("Gare", "Gare de Lyon"), so that a client ca
 
 Rail stations (train, metro, tram, funicular) carry their `tracks`, `[{ref, lat, lng, on_track}]`:
 where a vehicle calling at that track stops. `on_track` is false where only a platform between
-two tracks gives it.
+two tracks gives it. Tracks are listed by number, "12a" and "3 bis" after tracks 12 and 3, then
+those whose `ref` names the part of the station they are in ("1 Est", "1 Ovest" at Bologna
+Centrale), part by part.
