@@ -1082,8 +1082,13 @@ UNION ALL
 SELECT DISTINCT n.station_id, n.mode, v.name, true, v.place, false
 FROM plain_names n
 JOIN stations s USING (station_id)
+-- And its region's, where no town was found for it: Basmane's city is its neighbourhood,
+-- Etiler Mahallesi, and only its province names it İzmir. Not where one was: Winterthur is no
+-- answer for "zürich", its canton.
 CROSS JOIN LATERAL (VALUES (s.city['name']), (s.city['name:en']),
-                           (s.settlement['name']), (s.settlement['name:en'])) AS c(city)
+                           (s.settlement['name']), (s.settlement['name:en']),
+                           (CASE WHEN s.settlement IS NULL THEN s.region['name'] END),
+                           (CASE WHEN s.settlement IS NULL THEN s.region['name:en'] END)) AS c(city)
 CROSS JOIN LATERAL (VALUES (c.city || ' ' || n.name, search_fold(c.city)),
                            (n.name || ' ' || c.city, NULL)) AS v(name, place)
 WHERE c.city IS NOT NULL AND search_fold(n.name) NOT LIKE '%' || search_fold(c.city) || '%';
