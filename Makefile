@@ -28,10 +28,14 @@ all:
 download:
 	python3 regions.py --download-only $(REGIONS)
 
-# Always merged afresh: the regions may have changed since the last run.
+# Always merged afresh: the regions may have changed since the last run. Regions overlap
+# (Russia, Turkey, the Caucasus...) and Geofabrik cuts each on its own day, so an object
+# edited in between is in two versions, which merge both keeps and osm2pgsql refuses:
+# time-filter keeps each object's latest.
 filtered.osm.pbf: stations.params
 	python3 regions.py $(REGIONS)
-	osmium merge $(FILTERED) -f pbf -o $@.tmp --overwrite && mv $@.tmp $@
+	osmium merge $(FILTERED) -f pbf -o $@.merged.tmp --overwrite
+	osmium time-filter $@.merged.tmp -f pbf -o $@.tmp --overwrite && rm $@.merged.tmp && mv $@.tmp $@
 
 # Trainlog's country shapes, which the build gives each station its country from.
 countries.geojson:
