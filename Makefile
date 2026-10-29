@@ -35,7 +35,7 @@ download:
 filtered.osm.pbf: stations.params
 	python3 regions.py $(REGIONS)
 	osmium merge $(FILTERED) -f pbf -o $@.merged.tmp --overwrite
-	osmium time-filter $@.merged.tmp -f pbf -o $@.tmp --overwrite && rm $@.merged.tmp && mv $@.tmp $@
+	osmium time-filter -F pbf $@.merged.tmp -f pbf -o $@.tmp --overwrite && rm $@.merged.tmp && mv $@.tmp $@
 
 # Trainlog's country shapes, which the build gives each station its country from.
 countries.geojson:
