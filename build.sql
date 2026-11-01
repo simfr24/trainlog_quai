@@ -263,6 +263,21 @@ LEFT JOIN object_area oa USING (osm_type, osm_id)
 CROSS JOIN LATERAL (SELECT COALESCE('A' || oa.group_id, 'Q' || s.tags['wikidata'],
                                     s.osm_type || s.osm_id) AS key) k;
 
+-- @step shared metro stations
+-- Where one station node serves the metro and the trains (London's Farringdon, Moorgate),
+-- its train=yes is no noise: its stop area has train stop positions, not metro ones, and no
+-- train station of its own. That node is its train station too.
+INSERT INTO station_objects
+SELECT 'train', o.key, o.osm_type, o.osm_id, o.tags, o.geom, true, o.source_key, o.poles
+FROM station_objects o
+WHERE o.mode = 'metro' AND o.is_primary AND o.tags['train'] = 'yes'
+  AND EXISTS (
+      SELECT 1 FROM station_objects t
+      WHERE t.mode = 'train' AND t.key = o.key AND t.tags['public_transport'] = 'stop_position'
+        AND NOT EXISTS (SELECT 1 FROM stop_modes m
+                        WHERE m.osm_type = t.osm_type AND m.osm_id = t.osm_id AND m.mode = 'metro'))
+  AND NOT EXISTS (SELECT 1 FROM station_objects t WHERE t.mode = 'train' AND t.key = o.key AND t.is_primary);
+
 -- @step untagged stop positions
 -- Stop positions often carry no mode tag; inside a stop_area they belong to its stations.
 -- Not its entrances, which say nothing about where trains stop.
