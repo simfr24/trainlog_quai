@@ -310,13 +310,31 @@ def publish(con):
         conn.execute("CREATE UNIQUE INDEX ON key_redirects (mode, old_key)")
         concurrently([f"ANALYZE {SCHEMA}_build.{table}" for (table,) in conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = %s", (f"{SCHEMA}_build",))])
+        # Swapped by renaming, which locks no table: dropping live in place locked its tables
+        # one by one, and a search holding one while waiting for another deadlocked it. The old
+        # tables, which new searches no longer find, are dropped after.
+        drop_old(conn)
         with conn.transaction():
-            conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            conn.execute(f"DO $$ BEGIN IF to_regnamespace('{SCHEMA}') IS NOT NULL"
+                         f" THEN ALTER SCHEMA {SCHEMA} RENAME TO {SCHEMA}_old; END IF; END $$")
             conn.execute(f"ALTER SCHEMA {SCHEMA}_build RENAME TO {SCHEMA}")
+        drop_old(conn)
         if SCHEMA == "live":
             # Trainlog's usage counts (usage.py) follow the stations whose keys this build moved.
             follow_redirects(conn)
             prewarm(conn)
+
+
+def drop_old(conn):
+    """The schema a previous build was swapped out to. A search still on it can deadlock the
+    drop as it did the swap; it is the only one left, so another try gets through."""
+    for attempt in range(10):
+        try:
+            conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA}_old CASCADE")
+            return
+        except psycopg.errors.DeadlockDetected:
+            time.sleep(1 + attempt)
+    conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA}_old CASCADE")
 
 
 def prewarm(conn):
